@@ -5,6 +5,9 @@
  * Copyright (C) 2018 Redha Gouicem <redha.gouicem@lip6.fr>
  */
 
+#include "asm-generic/errno-base.h"
+#include "asm-generic/fcntl.h"
+#include "linux/types.h"
 #define pr_fmt(fmt) "%s:%s: " fmt, KBUILD_MODNAME, __func__
 
 #include <linux/module.h>
@@ -148,6 +151,175 @@ static int ouichefs_write_end(struct file *file, struct address_space *mapping,
 	return ret;
 }
 
+static ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count,
+			     loff_t *pos)
+{
+	int ret;
+	// Nothing to read
+	// Just return 0
+	if (count == 0)
+		return 0;
+
+	// If we try to read more than the file has,
+	// just return 0
+	if (*pos >= file->f_inode->i_size) {
+		return 0;
+	}
+
+	// if the request is for more data than the file has,
+	// adjust the count to the available data
+	count = min_t(size_t, count, file->f_inode->i_size - *pos);
+
+	// The logical index of the block to read for the current position
+	int iblock = *pos >> file->f_inode->i_sb->s_blocksize_bits;
+
+	// Modulo operation to get the offset within the block
+	// (only works for powers of 2)
+	int offset = *pos & (file->f_inode->i_sb->s_blocksize - 1);
+
+	// Adjust the count to the available data in the block
+	// We can't read more data than the block has
+	count = min_t(size_t, count, file->f_inode->i_sb->s_blocksize - offset);
+
+	// superblock has the field s_blocksize and s_blocksize_bits
+	// s_blocksize is the size of a block in the filesystem (the same as OUICHEFS_BLOCK_SIZE) = 4096
+	// s_blocksize_bits is the number of bits in the size of a block log2(OUICHEFS_BLOCK_SIZE) = 12
+	// the index block is a field on the ouichefs inode info.
+	// The index block field is a physical block number that contains the index block for the file.
+
+	struct buffer_head result_bh = {};
+
+	// Get the block and allocate it if it's not allocated
+	ret = ouichefs_file_get_block(file->f_inode, iblock, &result_bh, 0);
+	if (ret < 0)
+		goto out;
+
+	// If the block is not allocated, return an error
+	if (result_bh.b_blocknr == 0) {
+		ret = -EIO;
+		goto out;
+	}
+
+	struct buffer_head *data_bh =
+		sb_bread(file->f_inode->i_sb, result_bh.b_blocknr);
+
+	if (!data_bh) {
+		ret = -EIO;
+		goto out;
+	}
+
+	int bytes_not_copied =
+		copy_to_user(buf, data_bh->b_data + offset, count);
+
+	int bytes_copied = count - bytes_not_copied;
+
+	// Release the data block buffer head
+	// We don't need it anymore
+	brelse(data_bh);
+
+	// Only case we fail atp is really when the
+	// user space buffer is not valid
+	if (!bytes_copied) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	*pos += bytes_copied;
+
+	return bytes_copied;
+
+// out_brelse:
+// 	pr_err("error in out_brelse\n");
+// 	brelse(index_bh);
+out:
+	pr_err("error in out\n");
+	return ret;
+}
+
+static ssize_t ouichefs_write(struct file *file, const char __user *buf,
+			      size_t count, loff_t *pos)
+{
+	int ret = 0;
+
+	// Nothing to write
+	// Just return 0
+	if (count == 0)
+		return 0;
+
+	// Can't write more than the max file size
+	if (file->f_inode->i_size + count > OUICHEFS_MAX_FILESIZE) {
+		return -EFBIG;
+	}
+
+	// Check if the Append flag is set
+	if (file->f_flags & O_APPEND) {
+		*pos = file->f_inode->i_size;
+	}
+
+	// The logical index of the block to write for the current position
+	sector_t iblock = *pos >> file->f_inode->i_sb->s_blocksize_bits;
+
+	// Modulo operation to get the offset within the block
+	// (only works for powers of 2)
+	int offset = *pos & (file->f_inode->i_sb->s_blocksize - 1);
+
+	// Adjust the count to the available data in the block
+	// We can't write more data than the block has
+	count = min_t(size_t, count, file->f_inode->i_sb->s_blocksize - offset);
+
+	struct buffer_head result_bh = {};
+
+	// Get the block and allocate it if it's not allocated
+	ret = ouichefs_file_get_block(file->f_inode, iblock, &result_bh, 1);
+
+	if (ret < 0)
+		goto out;
+
+	struct buffer_head *data_bh =
+		sb_bread(file->f_inode->i_sb, result_bh.b_blocknr);
+
+	if (!data_bh) {
+		ret = -EIO;
+		goto out_truncate;
+	}
+
+	int bytes_not_copied =
+		copy_from_user(data_bh->b_data + offset, buf, count);
+
+	int bytes_copied = count - bytes_not_copied;
+
+	// If all the data was not copied, return an error
+	if (bytes_not_copied == count) {
+		ret = -EFAULT;
+		goto out_brelse;
+	}
+
+	*pos += bytes_copied;
+
+	file->f_inode->i_mtime = inode_set_ctime_current(file->f_inode);
+	if (*pos > file->f_inode->i_size) {
+		i_size_write(file->f_inode, *pos);
+		mark_inode_dirty(file->f_inode);
+	}
+
+	// Mark the block as dirty
+	mark_buffer_dirty(data_bh);
+	sync_dirty_buffer(data_bh);
+
+	brelse(data_bh);
+
+	return bytes_copied;
+out_brelse:
+	pr_err("error in out\n");
+	brelse(data_bh);
+out_truncate:
+	if (ouichefs_truncate(file->f_inode) < 0)
+		pr_err("%s:%d: truncate failed\n", __func__, __LINE__);
+
+out:
+	return ret;
+}
+
 const struct address_space_operations ouichefs_aops = {
 	.readahead = ouichefs_readahead,
 	.writepage = ouichefs_writepage,
@@ -158,6 +330,8 @@ const struct address_space_operations ouichefs_aops = {
 const struct file_operations ouichefs_file_ops = {
 	.owner = THIS_MODULE,
 	.llseek = generic_file_llseek,
+	.read = ouichefs_read,
+	.write = ouichefs_write,
 	.read_iter = generic_file_read_iter,
 	.write_iter = generic_file_write_iter,
 	.fsync = generic_file_fsync,
@@ -178,13 +352,16 @@ int ouichefs_truncate(struct inode *inode)
 		goto out;
 	}
 
-	ret = block_truncate_page(inode->i_mapping, inode->i_size, ouichefs_file_get_block);
+	ret = block_truncate_page(inode->i_mapping, inode->i_size,
+				  ouichefs_file_get_block);
 	if (ret < 0)
 		goto out_brelse;
 
-	struct ouichefs_file_index_block *index = (struct ouichefs_file_index_block *)bh->b_data;
+	struct ouichefs_file_index_block *index =
+		(struct ouichefs_file_index_block *)bh->b_data;
 
-	next_num_blocks = (inode->i_size + sb->s_blocksize - 1) >> sb->s_blocksize_bits;
+	next_num_blocks = (inode->i_size + sb->s_blocksize - 1) >>
+			  sb->s_blocksize_bits;
 	for (size_t i = next_num_blocks; i < OUICHEFS_FILE_MAX_BLOCKS; ++i) {
 		uint32_t bno = le32_to_cpu(index->blocks[i]);
 
