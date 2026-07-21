@@ -35,7 +35,7 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 	int ret = 0, bno;
 
 	/* If block number exceeds filesize, fail */
-	if (iblock >= OUICHEFS_FILE_MAX_BLOCKS)
+	if (iblock >= OUICHEFS_MAX_EXTENTS)
 		return -EFBIG;
 
 	/* Read index block from disk */
@@ -48,7 +48,8 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 	 * Check if iblock is already allocated. If not and create is true,
 	 * allocate it. Else, get the physical block number.
 	 */
-	if (index->blocks[iblock] == 0) {
+	if (index->extents[iblock].start == 0 &&
+	    index->extents[iblock].count == 0) {
 		if (!create) {
 			ret = 0;
 			goto brelse_index;
@@ -60,13 +61,14 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 			goto brelse_index;
 		}
 
-		index->blocks[iblock] = cpu_to_le32(bno);
+		index->extents[iblock].start = cpu_to_le32(bno);
+		index->extents[iblock].count = cpu_to_le32(1);
 		++inode->i_blocks;
 
 		mark_inode_dirty(inode);
 		mark_buffer_dirty(bh_index);
 	} else {
-		bno = le32_to_cpu(index->blocks[iblock]);
+		bno = le32_to_cpu(index->extents[iblock].start);
 	}
 
 	/* Map the physical block to the given buffer_head */
@@ -74,7 +76,6 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 
 brelse_index:
 	brelse(bh_index);
-
 	return ret;
 }
 
@@ -189,7 +190,7 @@ static ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count,
 
 	struct buffer_head result_bh = {};
 
-	// Get the block and allocate it if it's not allocated
+	// Get the block
 	ret = ouichefs_file_get_block(file->f_inode, iblock, &result_bh, 0);
 	if (ret < 0)
 		goto out;
@@ -362,8 +363,8 @@ int ouichefs_truncate(struct inode *inode)
 
 	next_num_blocks = (inode->i_size + sb->s_blocksize - 1) >>
 			  sb->s_blocksize_bits;
-	for (size_t i = next_num_blocks; i < OUICHEFS_FILE_MAX_BLOCKS; ++i) {
-		uint32_t bno = le32_to_cpu(index->blocks[i]);
+	for (size_t i = next_num_blocks; i < OUICHEFS_MAX_EXTENTS; ++i) {
+		uint32_t bno = le32_to_cpu(index->extents[i].start);
 
 		if (!bno)
 			continue;
@@ -371,7 +372,9 @@ int ouichefs_truncate(struct inode *inode)
 		put_block(sbi, bno);
 		--inode->i_blocks;
 
-		index->blocks[i] = cpu_to_le32(0);
+		// 0 is the same in big and little endian
+		index->extents[i].start = 0;
+		index->extents[i].count = 0;
 	}
 
 	mark_buffer_dirty(bh);

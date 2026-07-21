@@ -121,13 +121,17 @@ static void ouichefs_evict_inode(struct inode *inode)
 		}
 
 		if (S_ISREG(inode->i_mode)) {
-			file_index = (struct ouichefs_file_index_block *)bh->b_data;
+			file_index =
+				(struct ouichefs_file_index_block *)bh->b_data;
 
-			for (i = 0; i < OUICHEFS_FILE_MAX_BLOCKS; ++i) {
-				if (!le32_to_cpu(file_index->blocks[i]))
+			for (i = 0; i < OUICHEFS_MAX_EXTENTS; ++i) {
+				if (!le32_to_cpu(file_index->extents[i].start))
 					continue;
 
-				put_block(sbi, le32_to_cpu(file_index->blocks[i]));
+				put_block(
+					sbi,
+					le32_to_cpu(
+						file_index->extents[i].start));
 			}
 		}
 
@@ -198,7 +202,8 @@ static int sync_ifree(struct super_block *sb, int wait)
 			return -EIO;
 
 		copy_bitmap_to_le64((__le64 *)bh->b_data,
-			(void *)sbi->ifree_bitmap + i * OUICHEFS_BLOCK_SIZE);
+				    (void *)sbi->ifree_bitmap +
+					    i * OUICHEFS_BLOCK_SIZE);
 
 		mark_buffer_dirty(bh);
 		if (wait)
@@ -224,7 +229,8 @@ static int sync_bfree(struct super_block *sb, int wait)
 			return -EIO;
 
 		copy_bitmap_to_le64((__le64 *)bh->b_data,
-			(void *)sbi->bfree_bitmap + i * OUICHEFS_BLOCK_SIZE);
+				    (void *)sbi->bfree_bitmap +
+					    i * OUICHEFS_BLOCK_SIZE);
 
 		mark_buffer_dirty(bh);
 		if (wait)
@@ -352,8 +358,9 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 			goto free_ifree;
 		}
 
-		copy_bitmap_from_le64((void *)sbi->ifree_bitmap + i * OUICHEFS_BLOCK_SIZE,
-			(__le64 *)bh->b_data);
+		copy_bitmap_from_le64((void *)sbi->ifree_bitmap +
+					      i * OUICHEFS_BLOCK_SIZE,
+				      (__le64 *)bh->b_data);
 
 		brelse(bh);
 	}
@@ -374,8 +381,9 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 			goto free_bfree;
 		}
 
-		copy_bitmap_from_le64((void *)sbi->bfree_bitmap + i * OUICHEFS_BLOCK_SIZE,
-			(__le64 *)bh->b_data);
+		copy_bitmap_from_le64((void *)sbi->bfree_bitmap +
+					      i * OUICHEFS_BLOCK_SIZE,
+				      (__le64 *)bh->b_data);
 
 		brelse(bh);
 	}

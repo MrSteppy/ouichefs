@@ -136,11 +136,11 @@ fi
 rm -f "$MNT/w5"
 
 
-echo "=== WRITE: over OUICHEFS_MAX_FILESIZE (4 MiB) ==="
+echo "=== WRITE: over OUICHEFS_MAX_FILESIZE (2 MiB) ==="
 dd if=/dev/zero of="$MNT/w6" bs=4096 count=1024 2>/dev/null
 sz=$(stat -c '%s' "$MNT/w6")
-if [ "$sz" -ne 4194304 ]; then
-	echo "could not create 4MiB file, size=$sz"
+if [ "$sz" -ne 2097152 ]; then
+	echo "could not create 2MiB file, size=$sz"
 	valid=0
 else
 	if dd if=/dev/zero of="$MNT/w6" bs=1 seek=4194304 count=1 conv=notrunc 2>/dev/null; then
@@ -149,6 +149,16 @@ else
 	fi
 fi
 rm -f "$MNT/w6"
+
+echo "=== WRITE: exactly OUICHEFS_MAX_FILESIZE (2 MiB) ==="
+dd if=/dev/zero of="$MNT/w7" bs=4096 count=512 2>/dev/null
+sz=$(stat -c '%s' "$MNT/w7")
+if [ "$sz" -ne 2097152 ]; then
+	echo "could not create 2MiB file, size=$sz"
+	valid=0
+fi
+rm -f "$MNT/w7"
+
 
 
 ############################################
@@ -170,6 +180,96 @@ if [ "$got" != "version-two" ]; then
 	valid=0
 fi
 rm -f "$MNT/m1"
+
+
+############################################
+# IOCTL
+############################################
+
+echo "=== IOCTL: GET_EXTENTS ==="
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+major=$(grep ouichefs /proc/devices | awk '{print $1}')
+if [ -z "$major" ]; then
+	echo "no major number for ouichefs in /proc/devices!"
+	valid=0
+else
+	device=/dev/ouichefs_ioctl
+	rm -f "$device"
+	if ! mknod "$device" c "$major" 0; then
+		echo "could not create $device"
+		valid=0
+	else
+		# file spanning a few blocks → at least one extent
+		dd if=/dev/zero of="$MNT/ioctl_file" bs=4096 count=4 2>/dev/null
+
+		printf '%s\n' '
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include "extent_ioctl.h"
+
+int main(int argc, char **argv)
+{
+	int ctl, fd;
+
+	fd = open(argv[1], O_RDONLY);
+	if (fd < 0) {
+		perror("open file");
+		return 1;
+	}
+
+	ctl = open(argv[2], O_RDWR);
+	if (ctl < 0) {
+		perror("open ctl");
+		return 1;
+	}
+
+	/* kernel uses copy_from_user → pass &fd */
+	if (ioctl(ctl, OUICHEFS_IOC_GET_EXTENTS, &fd) < 0) {
+		perror("ioctl");
+		return 1;
+	}
+
+	close(ctl);
+	close(fd);
+	return 0;
+}
+' > /tmp/ouiche_ioctl_test.c
+
+		# userspace needs the ioctl macros; pull header from this dir
+		cp "$SCRIPT_DIR/extent_ioctl.h" /tmp/extent_ioctl.h
+		# ensure _IOW is available if the header does not include it
+		if ! grep -q 'linux/ioctl.h\|sys/ioctl.h' /tmp/extent_ioctl.h; then
+			printf '%s\n' '#include <sys/ioctl.h>' | cat - /tmp/extent_ioctl.h > /tmp/extent_ioctl.h.new
+			mv /tmp/extent_ioctl.h.new /tmp/extent_ioctl.h
+		fi
+
+		dmesg -C 2>/dev/null || true
+
+		if ! gcc -I/tmp -o /tmp/ouiche_ioctl_test /tmp/ouiche_ioctl_test.c; then
+			echo "can't compile ioctl test"
+			valid=0
+		elif ! /tmp/ouiche_ioctl_test "$MNT/ioctl_file" "$device"; then
+			echo "ioctl test program failed"
+			valid=0
+		elif ! dmesg | grep -q 'extents for inode'; then
+			echo "missing 'extents for inode' line in dmesg"
+			valid=0
+		elif ! dmesg | grep -qE '\[0\] start=[0-9]+ count=[0-9]+'; then
+			echo "missing extent detail line in dmesg"
+			valid=0
+		else
+			# show the pseudo-output style lines
+			dmesg | grep -E 'extents for inode|start='
+		fi
+
+		rm -f "$MNT/ioctl_file" "$device" \
+			/tmp/ouiche_ioctl_test /tmp/ouiche_ioctl_test.c \
+			/tmp/extent_ioctl.h /tmp/extent_ioctl.h.new
+	fi
+fi
 
 
 ############################################
