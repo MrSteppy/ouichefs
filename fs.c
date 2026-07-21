@@ -21,6 +21,7 @@ static long ouiche_unlocked_ioctl(struct file *file, unsigned int request_nr,
 				  unsigned long buf)
 
 {
+	int ret = 0;
 	if (request_nr == OUICHEFS_IOC_GET_EXTENTS) {
 		unsigned int kernel_fd;
 
@@ -38,8 +39,10 @@ static long ouiche_unlocked_ioctl(struct file *file, unsigned int request_nr,
 		struct buffer_head *bh_index =
 			sb_bread(inode->vfs_inode.i_sb, inode->index_block);
 
-		if (!bh_index)
-			return -EIO;
+		if (!bh_index) {
+			ret = -EIO;
+			goto out_fput;
+		}
 
 		struct ouichefs_file_index_block *index =
 			(struct ouichefs_file_index_block *)bh_index->b_data;
@@ -70,8 +73,13 @@ static long ouiche_unlocked_ioctl(struct file *file, unsigned int request_nr,
 			iblock += 1;
 		}
 
+		brelse(bh_index);
 		fput(file);
 		return 0;
+
+out_fput:
+		fput(file);
+		return ret;
 	} else {
 		return -ENOTTY;
 	}

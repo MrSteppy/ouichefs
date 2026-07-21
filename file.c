@@ -79,6 +79,32 @@ brelse_index:
 	return ret;
 }
 
+static uint32_t ouichefs_extent_get_block(struct ouichefs_extent *extents,
+					  uint32_t logical_block)
+{
+	uint32_t accumulated_count = 0;
+
+	struct ouichefs_extent extend = {};
+
+	for (uint32_t extents_index = 0; extents_index < OUICHEFS_MAX_EXTENTS;
+	     extents_index++) {
+		extend = extents[extents_index];
+
+		if (extend.count == 0)
+			break;
+
+		if (accumulated_count + le32_to_cpu(extend.count) >
+		    logical_block) {
+			return le32_to_cpu(extend.start) +
+			       (logical_block - accumulated_count);
+		}
+
+		accumulated_count += le32_to_cpu(extend.count);
+	}
+
+	return 0;
+}
+
 /*
  * Called by the page cache to read a page from the physical disk and map it in
  * memory.
@@ -188,21 +214,32 @@ static ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count,
 	// the index block is a field on the ouichefs inode info.
 	// The index block field is a physical block number that contains the index block for the file.
 
-	struct buffer_head result_bh = {};
+	struct ouichefs_inode_info *inode = OUICHEFS_INODE(file->f_inode);
+
+	struct buffer_head *bh_index =
+		sb_bread(file->f_inode->i_sb, inode->index_block);
+
+	if (!bh_index) {
+		ret = -EIO;
+		goto out;
+	}
+
+	struct ouichefs_file_index_block *index =
+		(struct ouichefs_file_index_block *)bh_index->b_data;
 
 	// Get the block
-	ret = ouichefs_file_get_block(file->f_inode, iblock, &result_bh, 0);
-	if (ret < 0)
-		goto out;
+	uint32_t physical_block_number =
+		ouichefs_extent_get_block(index->extents, iblock);
 
-	// If the block is not allocated, return an error
-	if (result_bh.b_blocknr == 0) {
+	brelse(bh_index);
+
+	if (physical_block_number == 0) {
 		ret = -EIO;
 		goto out;
 	}
 
 	struct buffer_head *data_bh =
-		sb_bread(file->f_inode->i_sb, result_bh.b_blocknr);
+		sb_bread(file->f_inode->i_sb, physical_block_number);
 
 	if (!data_bh) {
 		ret = -EIO;
@@ -231,7 +268,7 @@ static ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count,
 
 // out_brelse:
 // 	pr_err("error in out_brelse\n");
-// 	brelse(index_bh);
+// 	brelse(bh_index);
 out:
 	pr_err("error in out\n");
 	return ret;
