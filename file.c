@@ -19,6 +19,56 @@
 #include "ouichefs.h"
 #include "bitmap.h"
 
+int ouichefs_get_extend_of_logical_block(struct ouichefs_extent *extents,
+					 uint32_t logical_block,
+					 int *parent_extent_index,
+					 int *inner_extent_offset)
+{
+	uint32_t accumulated_count = 0;
+
+	struct ouichefs_extent extend = {};
+
+	for (uint32_t extents_index = 0; extents_index < OUICHEFS_MAX_EXTENTS;
+	     extents_index++) {
+		extend = extents[extents_index];
+
+		if (extend.count == 0) {
+			*parent_extent_index = extents_index;
+			*inner_extent_offset = 0;
+			return OUICHEFS_EXTENT_TYPE_INSERT_AT_END;
+		}
+
+		if (accumulated_count + le32_to_cpu(extend.count) >
+		    logical_block) {
+			*parent_extent_index = extents_index;
+			*inner_extent_offset =
+				(logical_block - accumulated_count);
+
+			return OUICHEFS_EXTENT_TYPE_FOUND;
+		}
+
+		accumulated_count += le32_to_cpu(extend.count);
+	}
+
+	return OUICHEFS_EXTENT_TYPE_OUT_OF_SPACE;
+}
+
+// static uint32_t ouichefs_extent_get_block(struct ouichefs_extent *extents,
+// 					  uint32_t logical_block)
+// {
+// 	int parent_extent_index = 0;
+// 	int last_extent_index = 0;
+
+// 	int ret = ouichefs_get_extend_of_logical_block(extents, logical_block,
+// 						       &parent_extent_index,
+// 						       &last_extent_index);
+// 	if (ret != OUICHEFS_EXTENT_TYPE_FOUND)
+// 		return 0;
+
+// 	return le32_to_cpu(extents[parent_extent_index].start) +
+// 	       last_extent_index;
+// }
+
 /*
  * Map the buffer_head passed in argument with the iblock-th block of the file
  * represented by inode. If the requested block is not allocated and create is
@@ -34,22 +84,26 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 	struct buffer_head *bh_index;
 	int ret = 0, bno;
 
-	/* If block number exceeds filesize, fail */
-	if (iblock >= OUICHEFS_MAX_EXTENTS)
-		return -EFBIG;
-
 	/* Read index block from disk */
 	bh_index = sb_bread(sb, ci->index_block);
 	if (!bh_index)
 		return -EIO;
 	index = (struct ouichefs_file_index_block *)bh_index->b_data;
 
+	int parent_extent_index = 0;
+	int last_extent_index = 0;
+
+	struct ouichefs_extent *parent_extent;
+	int result = ouichefs_get_extend_of_logical_block(index->extents,
+							  iblock,
+							  &parent_extent_index,
+							  &last_extent_index);
+
 	/*
 	 * Check if iblock is already allocated. If not and create is true,
 	 * allocate it. Else, get the physical block number.
 	 */
-	if (index->extents[iblock].start == 0 &&
-	    index->extents[iblock].count == 0) {
+	if (result == OUICHEFS_EXTENT_TYPE_INSERT_AT_END) {
 		if (!create) {
 			ret = 0;
 			goto brelse_index;
@@ -61,14 +115,34 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 			goto brelse_index;
 		}
 
-		index->extents[iblock].start = cpu_to_le32(bno);
-		index->extents[iblock].count = cpu_to_le32(1);
+		parent_extent = &index->extents[parent_extent_index - 1];
+
+		if (le32_to_cpu(parent_extent->start) +
+			    le32_to_cpu(parent_extent->count) ==
+		    bno) {
+			parent_extent->count = cpu_to_le32(
+				le32_to_cpu(parent_extent->count) + 1);
+		} else {
+			index->extents[parent_extent_index].start =
+				cpu_to_le32(bno);
+			index->extents[parent_extent_index].count =
+				cpu_to_le32(1);
+		}
+
 		++inode->i_blocks;
 
 		mark_inode_dirty(inode);
 		mark_buffer_dirty(bh_index);
+	} else if (result == OUICHEFS_EXTENT_TYPE_FOUND) {
+		parent_extent = &index->extents[parent_extent_index];
+		bno = le32_to_cpu(parent_extent->start) + last_extent_index;
 	} else {
-		bno = le32_to_cpu(index->extents[iblock].start);
+		if (create)
+			ret = -ENOSPC;
+		else
+			ret = -EFBIG;
+
+		goto brelse_index;
 	}
 
 	/* Map the physical block to the given buffer_head */
@@ -77,32 +151,6 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 brelse_index:
 	brelse(bh_index);
 	return ret;
-}
-
-static uint32_t ouichefs_extent_get_block(struct ouichefs_extent *extents,
-					  uint32_t logical_block)
-{
-	uint32_t accumulated_count = 0;
-
-	struct ouichefs_extent extend = {};
-
-	for (uint32_t extents_index = 0; extents_index < OUICHEFS_MAX_EXTENTS;
-	     extents_index++) {
-		extend = extents[extents_index];
-
-		if (extend.count == 0)
-			break;
-
-		if (accumulated_count + le32_to_cpu(extend.count) >
-		    logical_block) {
-			return le32_to_cpu(extend.start) +
-			       (logical_block - accumulated_count);
-		}
-
-		accumulated_count += le32_to_cpu(extend.count);
-	}
-
-	return 0;
 }
 
 /*
@@ -214,32 +262,20 @@ static ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count,
 	// the index block is a field on the ouichefs inode info.
 	// The index block field is a physical block number that contains the index block for the file.
 
-	struct ouichefs_inode_info *inode = OUICHEFS_INODE(file->f_inode);
+	struct buffer_head result_bh = {};
 
-	struct buffer_head *bh_index =
-		sb_bread(file->f_inode->i_sb, inode->index_block);
-
-	if (!bh_index) {
-		ret = -EIO;
+	ret = ouichefs_file_get_block(file->f_inode, iblock, &result_bh, 0);
+	if (ret < 0)
 		goto out;
-	}
 
-	struct ouichefs_file_index_block *index =
-		(struct ouichefs_file_index_block *)bh_index->b_data;
-
-	// Get the block
-	uint32_t physical_block_number =
-		ouichefs_extent_get_block(index->extents, iblock);
-
-	brelse(bh_index);
-
-	if (physical_block_number == 0) {
+	// If the block is not allocated, return an error
+	if (result_bh.b_blocknr == 0) {
 		ret = -EIO;
 		goto out;
 	}
 
 	struct buffer_head *data_bh =
-		sb_bread(file->f_inode->i_sb, physical_block_number);
+		sb_bread(file->f_inode->i_sb, result_bh.b_blocknr);
 
 	if (!data_bh) {
 		ret = -EIO;
@@ -400,14 +436,16 @@ int ouichefs_truncate(struct inode *inode)
 
 	next_num_blocks = (inode->i_size + sb->s_blocksize - 1) >>
 			  sb->s_blocksize_bits;
+	// Iterate over all extents
 	for (size_t i = next_num_blocks; i < OUICHEFS_MAX_EXTENTS; ++i) {
-		uint32_t bno = le32_to_cpu(index->extents[i].start);
+		unsigned int count = le32_to_cpu(index->extents[i].count);
 
-		if (!bno)
-			continue;
-
-		put_block(sbi, bno);
-		--inode->i_blocks;
+		// Iterate over all blocks in the extent
+		for (int j = 0; j < count; ++j) {
+			put_block(sbi,
+				  le32_to_cpu(index->extents[i].start) + j);
+			--inode->i_blocks;
+		}
 
 		// 0 is the same in big and little endian
 		index->extents[i].start = 0;

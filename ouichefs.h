@@ -21,8 +21,15 @@ struct ouichefs_extent;
 #define OUICHEFS_MAX_EXTENTS \
 	(OUICHEFS_BLOCK_SIZE / sizeof(struct ouichefs_extent))
 
-#define OUICHEFS_MAX_FILESIZE \
-	(OUICHEFS_MAX_EXTENTS * OUICHEFS_BLOCK_SIZE) /* 2 MiB */
+// #define OUICHEFS_MAX_FILESIZE
+// 	(OUICHEFS_MAX_EXTENTS * (1 << 32)) /* ~ 2048 GiB */
+
+#define OUICHEFS_MAX_FILESIZE ((loff_t) U32_MAX)
+enum {
+	OUICHEFS_EXTENT_TYPE_FOUND = 0,
+	OUICHEFS_EXTENT_TYPE_INSERT_AT_END,
+	OUICHEFS_EXTENT_TYPE_OUT_OF_SPACE,
+};
 
 /*
  * ouiche_fs partition layout

@@ -136,29 +136,12 @@ fi
 rm -f "$MNT/w5"
 
 
-echo "=== WRITE: over OUICHEFS_MAX_FILESIZE (2 MiB) ==="
-dd if=/dev/zero of="$MNT/w6" bs=4096 count=1024 2>/dev/null
-sz=$(stat -c '%s' "$MNT/w6")
-if [ "$sz" -ne 2097152 ]; then
-	echo "could not create 2MiB file, size=$sz"
-	valid=0
-else
-	if dd if=/dev/zero of="$MNT/w6" bs=1 seek=4194304 count=1 conv=notrunc 2>/dev/null; then
-		echo "write past max filesize should have failed"
-		valid=0
-	fi
-fi
-rm -f "$MNT/w6"
-
-echo "=== WRITE: exactly OUICHEFS_MAX_FILESIZE (2 MiB) ==="
-dd if=/dev/zero of="$MNT/w7" bs=4096 count=512 2>/dev/null
-sz=$(stat -c '%s' "$MNT/w7")
-if [ "$sz" -ne 2097152 ]; then
-	echo "could not create 2MiB file, size=$sz"
-	valid=0
-fi
-rm -f "$MNT/w7"
-
+# No "write past OUICHEFS_MAX_FILESIZE" test: with extents the limit is not a
+# fixed small constant. Practical bounds are free blocks on the volume and
+# (when fragmented) OUICHEFS_MAX_EXTENTS * block size; the theoretical
+# contiguous upper bound is huge. Exhausting the image would be slow and
+# image-size dependent, so we only check that we can exceed the old 4 MiB
+# pointer limit (see LARGE test below).
 
 
 ############################################
@@ -183,6 +166,39 @@ rm -f "$MNT/m1"
 
 
 ############################################
+# LARGE SEQUENTIAL FILE (> 4 MiB)
+############################################
+
+# Sequential append-only write from offset 0 (no backward seeks, no sparse
+# holes). Slightly larger than the old 4 MiB block-pointer limit.
+LARGE_BYTES=$((4 * 1024 * 1024 + 4096)) # 4 MiB + 1 block
+
+echo "=== WRITE/READ: sequential file > 4 MiB ($LARGE_BYTES bytes) ==="
+rm -f /tmp/ouiche_large_ref /tmp/ouiche_large_got
+# patterned reference so we catch short/corrupt reads, not just size
+dd if=/dev/urandom of=/tmp/ouiche_large_ref bs=4096 count=$((LARGE_BYTES / 4096)) 2>/dev/null
+if ! dd if=/tmp/ouiche_large_ref of="$MNT/large" bs=4096 2>/dev/null; then
+	echo "failed to write >4MiB sequential file"
+	valid=0
+else
+	sz=$(stat -c '%s' "$MNT/large")
+	if [ "$sz" -ne "$LARGE_BYTES" ]; then
+		echo "expected size $LARGE_BYTES after >4MiB write, got $sz"
+		valid=0
+	elif ! dd if="$MNT/large" of=/tmp/ouiche_large_got bs=4096 2>/dev/null; then
+		echo "failed to read >4MiB file back"
+		valid=0
+	elif ! cmp -s /tmp/ouiche_large_ref /tmp/ouiche_large_got; then
+		echo ">4MiB readback mismatch"
+		valid=0
+	else
+		echo "wrote and read back $LARGE_BYTES bytes OK"
+	fi
+fi
+# keep $MNT/large for the ioctl inspection below; cleaned up there
+
+
+############################################
 # IOCTL
 ############################################
 
@@ -200,9 +216,6 @@ else
 		echo "could not create $device"
 		valid=0
 	else
-		# file spanning a few blocks → at least one extent
-		dd if=/dev/zero of="$MNT/ioctl_file" bs=4096 count=4 2>/dev/null
-
 		printf '%s\n' '
 #include <stdio.h>
 #include <fcntl.h>
@@ -246,30 +259,74 @@ int main(int argc, char **argv)
 			mv /tmp/extent_ioctl.h.new /tmp/extent_ioctl.h
 		fi
 
-		dmesg -C 2>/dev/null || true
-
 		if ! gcc -I/tmp -o /tmp/ouiche_ioctl_test /tmp/ouiche_ioctl_test.c; then
 			echo "can't compile ioctl test"
 			valid=0
-		elif ! /tmp/ouiche_ioctl_test "$MNT/ioctl_file" "$device"; then
-			echo "ioctl test program failed"
-			valid=0
-		elif ! dmesg | grep -q 'extents for inode'; then
-			echo "missing 'extents for inode' line in dmesg"
-			valid=0
-		elif ! dmesg | grep -qE '\[0\] start=[0-9]+ count=[0-9]+'; then
-			echo "missing extent detail line in dmesg"
-			valid=0
 		else
-			# show the pseudo-output style lines
-			dmesg | grep -E 'extents for inode|start='
+			####################################
+			# small multi-block file
+			####################################
+			echo "--- ioctl on 4-block sequential file ---"
+			dd if=/dev/zero of="$MNT/ioctl_small" bs=4096 count=4 2>/dev/null
+			dmesg -C 2>/dev/null || true
+			if ! /tmp/ouiche_ioctl_test "$MNT/ioctl_small" "$device"; then
+				echo "ioctl on small file failed"
+				valid=0
+			elif ! dmesg | grep -q 'extents for inode'; then
+				echo "missing 'extents for inode' line in dmesg"
+				valid=0
+			elif ! dmesg | grep -qE '\[0\] start=[0-9]+ count=[0-9]+'; then
+				echo "missing extent detail line in dmesg"
+				valid=0
+			else
+				dmesg | grep -E 'extents for inode|start='
+			fi
+			rm -f "$MNT/ioctl_small"
+
+			####################################
+			# >4 MiB file written above (if present)
+			####################################
+			if [ -f "$MNT/large" ]; then
+				echo "--- ioctl on >4MiB sequential file ---"
+				dmesg -C 2>/dev/null || true
+				if ! /tmp/ouiche_ioctl_test "$MNT/large" "$device"; then
+					echo "ioctl on >4MiB file failed"
+					valid=0
+				elif ! dmesg | grep -q 'extents for inode'; then
+					echo "missing extents summary for large file"
+					valid=0
+				else
+					dmesg | grep -E 'extents for inode|start='
+					# Sum of extent counts should equal allocated data blocks.
+					# Without a contiguous allocator this is often 1:1 with
+					# blocks; with opportunistic coalesce it may be fewer.
+					blocks=$((LARGE_BYTES / 4096))
+					counts=$(dmesg | sed -n 's/.*count=\([0-9][0-9]*\).*/\1/p')
+					sum=0
+					n_ext=0
+					for c in $counts; do
+						sum=$((sum + c))
+						n_ext=$((n_ext + 1))
+					done
+					if [ "$sum" -ne "$blocks" ]; then
+						echo "extent count sum $sum != $blocks data blocks"
+						valid=0
+					else
+						echo "extent list covers $sum blocks in $n_ext extent(s)"
+					fi
+				fi
+			fi
 		fi
 
-		rm -f "$MNT/ioctl_file" "$device" \
+		rm -f "$MNT/large" "$device" \
 			/tmp/ouiche_ioctl_test /tmp/ouiche_ioctl_test.c \
-			/tmp/extent_ioctl.h /tmp/extent_ioctl.h.new
+			/tmp/extent_ioctl.h /tmp/extent_ioctl.h.new \
+			/tmp/ouiche_large_ref /tmp/ouiche_large_got
 	fi
 fi
+
+# in case ioctl section was skipped
+rm -f "$MNT/large" /tmp/ouiche_large_ref /tmp/ouiche_large_got
 
 
 ############################################

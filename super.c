@@ -124,14 +124,19 @@ static void ouichefs_evict_inode(struct inode *inode)
 			file_index =
 				(struct ouichefs_file_index_block *)bh->b_data;
 
+			// Iterate over all extents
 			for (i = 0; i < OUICHEFS_MAX_EXTENTS; ++i) {
-				if (!le32_to_cpu(file_index->extents[i].start))
-					continue;
+				unsigned int count = le32_to_cpu(
+					file_index->extents[i].count);
 
-				put_block(
-					sbi,
-					le32_to_cpu(
-						file_index->extents[i].start));
+				// Iterate over all blocks in the extent
+				for (int j = 0; j < count; ++j) {
+					put_block(sbi,
+						  le32_to_cpu(
+							  file_index->extents[i]
+								  .start) +
+							  j);
+				}
 			}
 		}
 
