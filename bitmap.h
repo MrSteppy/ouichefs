@@ -65,6 +65,38 @@ static inline uint32_t get_free_block(struct ouichefs_sb_info *sbi)
 	return ret;
 }
 
+static inline uint32_t ouichefs_alloc_contiguous(const struct super_block *sb,
+						 uint32_t requested,
+						 uint32_t *block)
+{
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+	unsigned long *free_map = sbi->bfree_bitmap;
+	const unsigned long size = sbi->nr_blocks;
+
+	unsigned long b, e;
+	unsigned long bno = 0, bno_size = 0;
+	for_each_set_bitrange(b, e, free_map, size) {
+		if (e - b > bno_size) {
+			bno = b;
+			bno_size = e - b;
+
+			if (bno_size >= requested) {
+				break;
+			}
+		}
+	}
+
+	bno_size = min_t(unsigned long, bno_size, requested);
+
+	if (bno_size) {
+		bitmap_clear(free_map, bno, bno_size);
+		sbi->nr_free_blocks -= bno_size;
+	}
+
+	*block = bno;
+	return bno_size;
+}
+
 /*
  * Mark the i-th bit in freemap as free (i.e. 1)
  */

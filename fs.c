@@ -5,8 +5,8 @@
  * Copyright (C) 2018  Redha Gouicem <redha.gouicem@lip6.fr>
  */
 
-#include "linux/buffer_head.h"
-#include "linux/file.h"
+#include <linux/buffer_head.h>
+#include <linux/file.h>
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -15,62 +15,71 @@
 #include "ouichefs.h"
 #include "extent_ioctl.h"
 
-static unsigned int major;
+static int major;
 
-static long ouiche_unlocked_ioctl(struct file *file, unsigned int request_nr,
-				  unsigned long buf)
-
+static long ouichefs_unlocked_ioctl(struct file *f,
+				    const unsigned int request_nr,
+				    const unsigned long buf)
 {
 	int ret = 0;
 	if (request_nr == OUICHEFS_IOC_GET_EXTENTS) {
 		unsigned int kernel_fd;
 
 		if (copy_from_user(&kernel_fd, (unsigned int __user *)buf,
-				   sizeof(kernel_fd)))
+				   sizeof(kernel_fd))) {
+			pr_err("Failed to read file descriptor from userspace\n");
 			return -EFAULT;
+		}
 
 		struct file *file = fget(kernel_fd);
-		if (!file)
+		if (!file) {
+			pr_err("Failed to open file\n");
 			return -EBADF;
+		}
 
-		struct ouichefs_inode_info *inode =
-			OUICHEFS_INODE(file->f_inode);
+		//ensure the file is a ouichefs file
+		if (file->f_op != &ouichefs_file_ops) {
+			pr_err("File is not a ouichefs file\n");
+			ret = -EINVAL;
+			goto out_fput;
+		}
 
-		struct buffer_head *bh_index =
-			sb_bread(inode->vfs_inode.i_sb, inode->index_block);
+		const struct inode *inode = file->f_inode;
+		const struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
+
+		struct super_block *sb = inode->i_sb;
+		struct buffer_head *bh_index = sb_bread(sb, ci->index_block);
 
 		if (!bh_index) {
+			pr_err("Failed to read index block\n");
 			ret = -EIO;
 			goto out_fput;
 		}
 
-		struct ouichefs_file_index_block *index =
+		const struct ouichefs_file_index_block *index =
 			(struct ouichefs_file_index_block *)bh_index->b_data;
 
-		int iblock = 0;
+		//count the number of used extents
 		int extent_count = 0;
-		while (index->extents[iblock].count != 0 &&
-		       iblock < OUICHEFS_MAX_EXTENTS) {
-			extent_count += 1;
-			iblock += 1;
-		}
+		const struct ouichefs_extent *extents = index->extents;
+		while (extents[extent_count].count != 0 &&
+		       extent_count < OUICHEFS_MAX_EXTENTS)
+			extent_count++;
 
 		pr_info("ouichefs: extents for inode %ld: %d extent(s)\n",
-			file->f_inode->i_ino, extent_count);
+			inode->i_ino, extent_count);
 
-		iblock = 0;
-		while (index->extents[iblock].count != 0 &&
-		       iblock < OUICHEFS_MAX_EXTENTS) {
-			pr_info("[%d] start=%d count=%d  (blocks %d–%d)\n",
-				iblock,
-				le32_to_cpu(index->extents[iblock].start),
-				le32_to_cpu(index->extents[iblock].count),
-				le32_to_cpu(index->extents[iblock].start),
-				le32_to_cpu(index->extents[iblock].start) +
-					le32_to_cpu(
-						index->extents[iblock].count) -
-					1);
-			iblock += 1;
+		for (size_t extent_index = 0;
+		     extents[extent_index].count != 0 &&
+		     extent_index < OUICHEFS_MAX_EXTENTS;
+		     extent_index++) {
+			const struct ouichefs_extent extent =
+				extents[extent_index];
+			const uint32_t start = le32_to_cpu(extent.start);
+			const uint32_t count = le32_to_cpu(extent.count);
+			pr_info("[%lu] start=%d count=%d  (blocks %d–%d)\n",
+				extent_index, start, count, start,
+				start + count - 1);
 		}
 
 		brelse(bh_index);
@@ -80,20 +89,22 @@ static long ouiche_unlocked_ioctl(struct file *file, unsigned int request_nr,
 out_fput:
 		fput(file);
 		return ret;
-	} else {
-		return -ENOTTY;
 	}
+
+	return -ENOTTY;
 }
 
 static struct file_operations ouichefs_ioctl_fops = {
-	.unlocked_ioctl = ouiche_unlocked_ioctl,
+	.owner = THIS_MODULE,
+	.unlocked_ioctl = ouichefs_unlocked_ioctl,
 };
 
 /*
  * Mount a ouiche_fs partition
  */
-struct dentry *ouichefs_mount(struct file_system_type *fs_type, int flags,
-			      const char *dev_name, void *data)
+static struct dentry *ouichefs_mount(struct file_system_type *fs_type,
+				     const int flags, const char *dev_name,
+				     void *data)
 {
 	struct dentry *dentry = NULL;
 
@@ -110,7 +121,7 @@ struct dentry *ouichefs_mount(struct file_system_type *fs_type, int flags,
 /*
  * Unmount a ouiche_fs partition
  */
-void ouichefs_kill_sb(struct super_block *sb)
+static void ouichefs_kill_sb(struct super_block *sb)
 {
 	kill_block_super(sb);
 
@@ -128,9 +139,7 @@ static struct file_system_type ouichefs_file_system_type = {
 
 static int __init ouichefs_init(void)
 {
-	int ret;
-
-	ret = ouichefs_init_inode_cache();
+	int ret = ouichefs_init_inode_cache();
 	if (ret) {
 		pr_err("inode cache creation failed\n");
 		goto err;
@@ -143,8 +152,6 @@ static int __init ouichefs_init(void)
 	}
 
 	major = register_chrdev(0, "ouichefs", &ouichefs_ioctl_fops);
-
-	pr_info("major number: %d\n", major);
 
 	if (major < 0) {
 		ret = major;
@@ -162,11 +169,9 @@ err:
 
 static void __exit ouichefs_exit(void)
 {
-	int ret;
-
 	unregister_chrdev(major, "ouichefs");
 
-	ret = unregister_filesystem(&ouichefs_file_system_type);
+	const int ret = unregister_filesystem(&ouichefs_file_system_type);
 	if (ret)
 		pr_err("unregister_filesystem() failed\n");
 
