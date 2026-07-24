@@ -66,7 +66,7 @@ static inline uint32_t get_free_block(struct ouichefs_sb_info *sbi)
 }
 
 static inline uint32_t ouichefs_alloc_contiguous(const struct super_block *sb,
-						 uint32_t requested,
+						 const uint32_t requested,
 						 uint32_t *block)
 {
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);

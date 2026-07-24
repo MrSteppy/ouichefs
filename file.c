@@ -138,6 +138,8 @@ static int ouichefs_file_allocate_blocks(struct inode *inode,
 
 	if (result == OUICHEFS_EXTENT_TYPE_INSERT_AT_END) {
 		const uint32_t nob = ouichefs_alloc_contiguous(sb, nr, &bno);
+		pr_info("Requested to allocate %d blocks and got %d\n", nr,
+			nob);
 		if (!nob) {
 			ret = -ENOSPC;
 			goto brelse_index;
@@ -363,6 +365,7 @@ static ssize_t ouichefs_write(struct file *file, const char __user *buf,
 			      size_t count, loff_t *pos)
 {
 	ssize_t ret = 0;
+	pr_info("Got a request to write %lu bytes\n", count);
 
 	// Nothing to write
 	// Just return 0
