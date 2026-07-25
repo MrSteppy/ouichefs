@@ -68,6 +68,36 @@ static int ouichefs_get_extent_of_logical_block(
 // 	       last_extent_index;
 // }
 
+/*
+ * Reclaim unused reserved blocks from every inode on this superblock except
+ * @skip (the allocator that ran out of space). Called when contiguous
+ * allocation fails because reserved-but-unused blocks still sit in other
+ * files' reservation windows.
+ */
+void ouichefs_collect_garbage(struct inode *skip)
+{
+	struct super_block *sb = skip->i_sb;
+	struct ouichefs_sb_info *sb_info = OUICHEFS_SB(sb);
+	struct inode *iter_node;
+
+	sb_info->gc_count++;
+
+	spin_lock(&sb->s_inode_list_lock);
+	list_for_each_entry(iter_node, &sb->s_inodes, i_sb_list) {
+		if (iter_node == skip) {
+			/* skip caller: no reservation left to free, avoid
+			 * nested locking if we already hold related state */
+			continue;
+		}
+		spin_lock(&iter_node->i_lock);
+		if (ouichefs_release_reservations(iter_node))
+			pr_warn("Failed to release reservations for inode %lu\n",
+				iter_node->i_ino);
+		spin_unlock(&iter_node->i_lock);
+	}
+	spin_unlock(&sb->s_inode_list_lock);
+}
+
 static int ouichefs_file_get_allocated_blocks(struct inode *inode,
 					      const sector_t iblock,
 					      const unsigned int nr,
@@ -119,12 +149,12 @@ static int ouichefs_file_allocate_blocks(struct inode *inode,
 					 struct buffer_head *bh_result)
 {
 	struct super_block *sb = inode->i_sb;
-	const struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
+	struct ouichefs_inode_info *inode_info = OUICHEFS_INODE(inode);
 	int ret = 0;
 	uint32_t bno;
 
 	/* Read index block from disk */
-	struct buffer_head *bh_index = sb_bread(sb, ci->index_block);
+	struct buffer_head *bh_index = sb_bread(sb, inode_info->index_block);
 	if (!bh_index)
 		return -EIO;
 	struct ouichefs_file_index_block *index =
@@ -139,13 +169,50 @@ static int ouichefs_file_allocate_blocks(struct inode *inode,
 		&inner_extent_offset);
 
 	if (result == OUICHEFS_EXTENT_TYPE_INSERT_AT_END) {
-		const uint32_t nob = ouichefs_alloc_contiguous(sb, nr, &bno);
-		pr_info("Requested to allocate %d blocks and got %d\n", nr,
-			nob);
-		if (!nob) {
-			ret = -ENOSPC;
-			goto brelse_index;
+		// if not reserve_present:
+		//   allocate to reserve
+		// use reserve
+		// update extent array
+
+		if (!inode_info->i_reserved_count) {
+			//one large allocation call, to fight fragmentation;
+			//might allocate less, but that is fine
+			//we reserve number + reservation since we don't want to
+			//exhaust reservation window in this write directly
+			const unsigned int nob_to_allocate =
+				reservation_size + nr;
+			uint32_t nob = ouichefs_alloc_contiguous(
+				sb, nob_to_allocate, &bno);
+			if (!nob) {
+				ouichefs_collect_garbage(inode);
+
+				//retry once
+				nob = ouichefs_alloc_contiguous(
+					sb, nob_to_allocate, &bno);
+				if (!nob) {
+					ret = -ENOSPC;
+					goto brelse_index;
+				}
+			}
+
+			pr_info("Allocated %d of %d requested blocks\n", nob,
+				nob_to_allocate);
+
+			//allocate everything to reserve; there is realistically no limit
+			inode_info->i_reserved_count = nob;
+			inode_info->i_reserved_start = bno;
 		}
+
+		//use reserve
+		const uint32_t nob =
+			min_t(uint32_t, nr, inode_info->i_reserved_count);
+		bno = inode_info->i_reserved_start;
+
+		inode_info->i_reserved_count -= nob;
+		inode_info->i_reserved_start += nob;
+
+		pr_info("Reserve of inode %lu is now %d blocks", inode->i_ino,
+			inode_info->i_reserved_count);
 
 		//check if we can append to existing extent
 		int extent_initialized = 0;
@@ -379,6 +446,7 @@ out:
 	return ret;
 }
 
+// ReSharper disable once CppParameterMayBeConstPtrOrRef
 static ssize_t ouichefs_write(struct file *file, const char __user *buf,
 			      size_t count, loff_t *pos)
 {
@@ -408,6 +476,7 @@ static ssize_t ouichefs_write(struct file *file, const char __user *buf,
 	const unsigned long s_blocksize = sb->s_blocksize;
 	// Modulo operation to get the offset within the block
 	// (only works for powers of 2)
+	// ReSharper disable once CppRedundantParentheses
 	unsigned int offset = *pos & (s_blocksize - 1);
 
 	struct buffer_head result_bh = {};
@@ -483,6 +552,31 @@ out:
 	return ret;
 }
 
+int ouichefs_release_reservations(const struct inode *inode)
+{
+	struct ouichefs_inode_info *inode_info = OUICHEFS_INODE(inode);
+	if (!inode_info->i_reserved_count)
+		return 0;
+
+	const int ret = ouichefs_free_contiguous(inode->i_sb,
+						 inode_info->i_reserved_start,
+						 inode_info->i_reserved_count);
+	if (ret)
+		return ret;
+
+	inode_info->i_reserved_start = 0;
+	inode_info->i_reserved_count = 0;
+
+	return 0;
+}
+
+// ReSharper disable once CppParameterMayBeConstPtrOrRef
+// ReSharper disable once CppParameterNeverUsed
+static int ouichefs_release(struct inode *inode, struct file *file)
+{
+	return ouichefs_release_reservations(inode);
+}
+
 const struct address_space_operations ouichefs_aops = {
 	.readahead = ouichefs_readahead,
 	.writepage = ouichefs_writepage,
@@ -498,6 +592,7 @@ const struct file_operations ouichefs_file_ops = {
 	.read_iter = generic_file_read_iter,
 	.write_iter = generic_file_write_iter,
 	.fsync = generic_file_fsync,
+	.release = ouichefs_release,
 };
 
 int ouichefs_truncate(struct inode *inode)
@@ -505,11 +600,10 @@ int ouichefs_truncate(struct inode *inode)
 	int ret;
 	struct super_block *sb = inode->i_sb;
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
-	struct ouichefs_inode_info *inode_info = OUICHEFS_INODE(inode);
-	struct buffer_head *bh;
+	const struct ouichefs_inode_info *inode_info = OUICHEFS_INODE(inode);
 	size_t next_num_blocks;
 
-	bh = sb_bread(sb, inode_info->index_block);
+	struct buffer_head *bh = sb_bread(sb, inode_info->index_block);
 	if (!bh) {
 		ret = -EIO;
 		goto out;
@@ -527,7 +621,7 @@ int ouichefs_truncate(struct inode *inode)
 			  sb->s_blocksize_bits;
 	// Iterate over all extents
 	for (size_t i = next_num_blocks; i < OUICHEFS_MAX_EXTENTS; ++i) {
-		unsigned int count = le32_to_cpu(index->extents[i].count);
+		const unsigned int count = le32_to_cpu(index->extents[i].count);
 
 		// Iterate over all blocks in the extent
 		for (int j = 0; j < count; ++j) {

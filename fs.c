@@ -15,6 +15,11 @@
 #include "ouichefs.h"
 #include "extent_ioctl.h"
 
+uint32_t reservation_size = 8;
+module_param(reservation_size, uint, 0644);
+MODULE_PARM_DESC(reservation_size,
+		 "Reservation size for the contiguous block allocator");
+
 static int major;
 
 static long ouichefs_unlocked_ioctl(struct file *f,
@@ -66,8 +71,11 @@ static long ouichefs_unlocked_ioctl(struct file *f,
 		       extent_count < OUICHEFS_MAX_EXTENTS)
 			extent_count++;
 
-		pr_info("ouichefs: extents for inode %ld: %d extent(s)\n",
-			inode->i_ino, extent_count);
+		struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+		pr_info("ouichefs: extents for inode %ld: %d extent(s), "
+			"%d reserved block(s) at %d, gc_count=%u\n",
+			inode->i_ino, extent_count, ci->i_reserved_count,
+			ci->i_reserved_start, sbi->gc_count);
 
 		for (size_t extent_index = 0;
 		     extents[extent_index].count != 0 &&

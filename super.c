@@ -41,6 +41,9 @@ static struct inode *ouichefs_alloc_inode(struct super_block *sb)
 	ci = kmem_cache_alloc(ouichefs_inode_cache, GFP_KERNEL);
 	if (!ci)
 		return NULL;
+	ci->index_block = 0;
+	ci->i_reserved_start = 0;
+	ci->i_reserved_count = 0;
 	inode_init_once(&ci->vfs_inode);
 	return &ci->vfs_inode;
 }
@@ -105,6 +108,9 @@ static void ouichefs_evict_inode(struct inode *inode)
 	struct ouichefs_file_index_block *file_index;
 	uint32_t ino = inode->i_ino;
 	uint32_t i;
+
+	if (ouichefs_release_reservations(inode))
+		pr_warn("failed to release inode reservations\n");
 
 	truncate_inode_pages_final(&inode->i_data);
 

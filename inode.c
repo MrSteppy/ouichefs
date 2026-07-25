@@ -155,11 +155,16 @@ static struct inode *ouichefs_new_inode(struct inode *dir, mode_t mode)
 		return ERR_PTR(-EINVAL);
 	}
 
-	/* Check if inodes are available */
+	/* Check if inodes / blocks are available (GC may reclaim reservations) */
 	sb = dir->i_sb;
 	sbi = OUICHEFS_SB(sb);
-	if (sbi->nr_free_inodes == 0 || sbi->nr_free_blocks == 0)
+	if (sbi->nr_free_inodes == 0)
 		return ERR_PTR(-ENOSPC);
+	if (sbi->nr_free_blocks == 0) {
+		ouichefs_collect_garbage(dir);
+		if (sbi->nr_free_blocks == 0)
+			return ERR_PTR(-ENOSPC);
+	}
 
 	/* Get a new free inode */
 	ino = get_free_inode(sbi);
@@ -175,8 +180,12 @@ static struct inode *ouichefs_new_inode(struct inode *dir, mode_t mode)
 	/* Get a free block for this new inode's index */
 	bno = get_free_block(sbi);
 	if (!bno) {
-		ret = -ENOSPC;
-		goto put_inode;
+		ouichefs_collect_garbage(dir);
+		bno = get_free_block(sbi);
+		if (!bno) {
+			ret = -ENOSPC;
+			goto put_inode;
+		}
 	}
 	ci->index_block = bno;
 

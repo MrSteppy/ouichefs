@@ -65,8 +65,12 @@ struct ouichefs_inode {
 	__le32 index_block; /* Block with list of blocks for this file */
 };
 
+extern uint32_t reservation_size;
+
 struct ouichefs_inode_info {
 	uint32_t index_block;
+	uint32_t i_reserved_start; /* first pre-reserved block           */
+	uint32_t i_reserved_count; /* number of pre-reserved blocks left */
 	struct inode vfs_inode;
 };
 
@@ -85,6 +89,8 @@ struct ouichefs_sb_info {
 
 	uint32_t nr_free_inodes; /* Number of free inodes */
 	uint32_t nr_free_blocks; /* Number of free blocks */
+
+	uint32_t gc_count;
 
 	unsigned long *ifree_bitmap; /* In-memory free inodes bitmap */
 	unsigned long *bfree_bitmap; /* In-memory free blocks bitmap */
@@ -113,6 +119,10 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent);
 int ouichefs_init_inode_cache(void);
 void ouichefs_destroy_inode_cache(void);
 struct inode *ouichefs_iget(struct super_block *sb, unsigned long ino);
+
+/* inode reservation / GC functions */
+int ouichefs_release_reservations(const struct inode *inode);
+void ouichefs_collect_garbage(struct inode *skip);
 
 /* file functions */
 extern const struct file_operations ouichefs_file_ops;
