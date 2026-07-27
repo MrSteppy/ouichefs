@@ -180,7 +180,7 @@ static ssize_t avg_extent_size_show(struct kobject *kobj,
 {
 	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
 	const uint32_t avg_extent_size =
-		sbi->nr_total_extents ? sbi->accumulated_extents_size * 100 /
+		sbi->nr_total_extents ? sbi->accumulated_extents_count * 100 /
 						sbi->nr_total_extents :
 					0;
 	return sysfs_emit(buf, "%u\n", avg_extent_size);
@@ -226,7 +226,7 @@ static ssize_t reservation_window_store(struct kobject *kobj,
 	if (kstrtou32(buf, 0, &reservation_size)) {
 		pr_err("Failed to parse reservation window\n");
 	}
-	return (ssize_t) count;
+	return (ssize_t)count;
 }
 
 static struct kobj_attribute ouichefs_reservation_window_attr =

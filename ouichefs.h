@@ -93,7 +93,7 @@ struct ouichefs_sb_info {
 	uint32_t nr_reserved_blocks;
 	uint32_t nr_regular_files;
 	uint32_t nr_total_extents;
-	uint32_t accumulated_extents_size;
+	uint32_t accumulated_extents_count;
 	uint32_t max_file_size;
 
 	uint32_t gc_count;
@@ -129,7 +129,7 @@ struct inode *ouichefs_iget(struct super_block *sb, unsigned long ino);
 
 /* inode reservation / GC functions */
 int ouichefs_release_reservations(const struct inode *inode);
-void ouichefs_collect_garbage(struct inode *skip);
+void ouichefs_collect_garbage(const struct inode *skip);
 
 /* file functions */
 extern const struct file_operations ouichefs_file_ops;

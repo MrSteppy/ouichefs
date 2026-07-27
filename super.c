@@ -107,7 +107,6 @@ static void ouichefs_evict_inode(struct inode *inode)
 	struct buffer_head *bh;
 	struct ouichefs_file_index_block *file_index;
 	uint32_t ino = inode->i_ino;
-	uint32_t i;
 
 	if (ouichefs_release_reservations(inode))
 		pr_warn("failed to release inode reservations\n");
@@ -131,24 +130,26 @@ static void ouichefs_evict_inode(struct inode *inode)
 				(struct ouichefs_file_index_block *)bh->b_data;
 
 			// Iterate over all extents
-			for (i = 0; i < OUICHEFS_MAX_EXTENTS; ++i) {
-				unsigned int count = le32_to_cpu(
-					file_index->extents[i].count);
+			for (uint32_t i = 0; i < OUICHEFS_MAX_EXTENTS; ++i) {
+				const struct ouichefs_extent *extent =
+					&file_index->extents[i];
+				const unsigned int count =
+					le32_to_cpu(extent->count);
+				const unsigned int start =
+					le32_to_cpu(extent->start);
 
 				if (!count)
 					break;
 
-				// Iterate over all blocks in the extent
-				for (int j = 0; j < count; ++j) {
-					put_block(sbi,
-						  le32_to_cpu(
-							  file_index->extents[i]
-								  .start) +
-							  j);
+				if (start) {
+					// Iterate over all blocks in the extent
+					for (int j = 0; j < count; ++j) {
+						put_block(sbi, start + j);
+					}
 				}
 
 				sbi->nr_total_extents--;
-				sbi->accumulated_extents_size -= count;
+				sbi->accumulated_extents_count -= count;
 			}
 		}
 
@@ -203,8 +204,8 @@ static int sync_sb_info(struct super_block *sb, int wait)
 	disk_sb->nr_free_blocks = cpu_to_le32(sbi->nr_free_blocks);
 	disk_sb->nr_regular_files = cpu_to_le32(sbi->nr_regular_files);
 	disk_sb->nr_total_extents = cpu_to_le32(sbi->nr_total_extents);
-	disk_sb->accumulated_extents_size =
-		cpu_to_le32(sbi->accumulated_extents_size);
+	disk_sb->accumulated_extents_count =
+		cpu_to_le32(sbi->accumulated_extents_count);
 	disk_sb->max_file_size = cpu_to_le32(sbi->max_file_size);
 
 	mark_buffer_dirty(bh);
@@ -368,8 +369,8 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->nr_free_blocks = le32_to_cpu(csb->nr_free_blocks);
 	sbi->nr_regular_files = le32_to_cpu(csb->nr_regular_files);
 	sbi->nr_total_extents = le32_to_cpu(csb->nr_total_extents);
-	sbi->accumulated_extents_size =
-		le32_to_cpu(csb->accumulated_extents_size);
+	sbi->accumulated_extents_count =
+		le32_to_cpu(csb->accumulated_extents_count);
 	sbi->max_file_size = le32_to_cpu(csb->max_file_size);
 	sbi->nr_committed_blocks = sbi->nr_blocks - sbi->nr_free_blocks;
 	sb->s_fs_info = sbi;

@@ -91,7 +91,6 @@ static inline uint32_t ouichefs_alloc_contiguous(const struct super_block *sb,
 	if (nob) {
 		bitmap_clear(free_map, bno, nob);
 		sbi->nr_free_blocks -= nob;
-		pr_info("Allocated %lu blocks", nob);
 	}
 
 	*block = bno;
@@ -112,7 +111,6 @@ static inline int ouichefs_free_contiguous(const struct super_block *sb,
 
 	bitmap_set(free_map, bno, nob);
 	sbi->nr_free_blocks += nob;
-	pr_info("Freed %u blocks", nob);
 	return 0;
 }
 
