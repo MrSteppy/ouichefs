@@ -188,6 +188,7 @@ static struct inode *ouichefs_new_inode(struct inode *dir, mode_t mode)
 		}
 	}
 	ci->index_block = bno;
+	sbi->nr_committed_blocks++; //track index block
 
 	/* Initialize inode */
 	inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
@@ -199,6 +200,7 @@ static struct inode *ouichefs_new_inode(struct inode *dir, mode_t mode)
 		inode->i_size = 0;
 		inode->i_fop = &ouichefs_file_ops;
 		inode->i_mapping->a_ops = &ouichefs_aops;
+		sbi->nr_regular_files++;
 	}
 	set_nlink(inode, 1);
 

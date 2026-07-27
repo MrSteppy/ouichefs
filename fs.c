@@ -21,7 +21,9 @@ MODULE_PARM_DESC(reservation_size,
 		 "Reservation size for the contiguous block allocator");
 
 static int major;
+static struct kobject *ouichefs_kobj;
 
+// ReSharper disable once CppParameterNeverUsed
 static long ouichefs_unlocked_ioctl(struct file *f,
 				    const unsigned int request_nr,
 				    const unsigned long buf)
@@ -71,7 +73,7 @@ static long ouichefs_unlocked_ioctl(struct file *f,
 		       extent_count < OUICHEFS_MAX_EXTENTS)
 			extent_count++;
 
-		struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+		const struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 		pr_info("ouichefs: extents for inode %ld: %d extent(s), "
 			"%d reserved block(s) at %d, gc_count=%u\n",
 			inode->i_ino, extent_count, ci->i_reserved_count,
@@ -107,6 +109,191 @@ static struct file_operations ouichefs_ioctl_fops = {
 	.unlocked_ioctl = ouichefs_unlocked_ioctl,
 };
 
+//sysfs stats
+
+static void
+ouichefs_stats_warn_on_sanity_fail(const struct ouichefs_sb_info *sbi)
+{
+	if (sbi->nr_blocks != sbi->nr_free_blocks + sbi->nr_committed_blocks +
+				      sbi->nr_reserved_blocks) {
+		pr_warn("ouichefs: sanity check failed: nr_blocks=%u, "
+			"nr_free_blocks=%u, nr_committed_blocks=%u, "
+			"nr_reserved_blocks=%u\n",
+			sbi->nr_blocks, sbi->nr_free_blocks,
+			sbi->nr_committed_blocks, sbi->nr_reserved_blocks);
+	}
+}
+
+static ssize_t free_blocks_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
+	ouichefs_stats_warn_on_sanity_fail(sbi);
+	return sysfs_emit(buf, "%u\n", sbi->nr_free_blocks);
+}
+
+static struct kobj_attribute ouichefs_free_blocks_attr = __ATTR_RO(free_blocks);
+
+static ssize_t commited_blocks_show(struct kobject *kobj,
+				    struct kobj_attribute *attr, char *buf)
+{
+	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
+	ouichefs_stats_warn_on_sanity_fail(sbi);
+	return sysfs_emit(buf, "%u\n", sbi->nr_committed_blocks);
+}
+
+static struct kobj_attribute ouichefs_commited_blocks_attr =
+	__ATTR_RO(commited_blocks);
+
+static ssize_t reserved_blocks_show(struct kobject *kobj,
+				    struct kobj_attribute *attr, char *buf)
+{
+	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
+	ouichefs_stats_warn_on_sanity_fail(sbi);
+	return sysfs_emit(buf, "%u\n", sbi->nr_reserved_blocks);
+}
+
+static struct kobj_attribute ouichefs_reserved_blocks_attr =
+	__ATTR_RO(reserved_blocks);
+
+static ssize_t files_show(struct kobject *kobj, struct kobj_attribute *attr,
+			  char *buf)
+{
+	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
+	return sysfs_emit(buf, "%u\n", sbi->nr_regular_files);
+}
+
+static struct kobj_attribute ouichefs_files_attr = __ATTR_RO(files);
+
+static ssize_t total_extents_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
+	return sysfs_emit(buf, "%u\n", sbi->nr_total_extents);
+}
+
+static struct kobj_attribute ouichefs_total_extents_attr =
+	__ATTR_RO(total_extents);
+
+static ssize_t avg_extent_size_show(struct kobject *kobj,
+				    struct kobj_attribute *attr, char *buf)
+{
+	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
+	const uint32_t avg_extent_size =
+		sbi->nr_total_extents ? sbi->accumulated_extents_size * 100 /
+						sbi->nr_total_extents :
+					0;
+	return sysfs_emit(buf, "%u\n", avg_extent_size);
+}
+
+static struct kobj_attribute ouichefs_avg_extent_size_attr =
+	__ATTR_RO(avg_extent_size);
+
+static ssize_t max_file_size_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
+	return sysfs_emit(buf, "%u\n", sbi->max_file_size);
+}
+
+static struct kobj_attribute ouichefs_max_file_size_attr =
+	__ATTR_RO(max_file_size);
+
+static ssize_t fragmentation_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
+	const uint32_t fragmentation =
+		sbi->nr_regular_files ?
+			sbi->nr_total_extents * 100 / sbi->nr_regular_files :
+			0;
+	return sysfs_emit(buf, "%u\n", fragmentation);
+}
+
+static struct kobj_attribute ouichefs_fragmentation_attr =
+	__ATTR_RO(fragmentation);
+
+static ssize_t reservation_window_show(struct kobject *kobj,
+				       struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", reservation_size);
+}
+
+static ssize_t reservation_window_store(struct kobject *kobj,
+					struct kobj_attribute *attr,
+					const char *buf, const size_t count)
+{
+	if (kstrtou32(buf, 0, &reservation_size)) {
+		pr_err("Failed to parse reservation window\n");
+	}
+	return (ssize_t) count;
+}
+
+static struct kobj_attribute ouichefs_reservation_window_attr =
+	__ATTR_RW(reservation_window);
+
+static ssize_t gc_count_show(struct kobject *kobj, struct kobj_attribute *attr,
+			     char *buf)
+{
+	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
+	return sysfs_emit(buf, "%u\n", sbi->gc_count);
+}
+
+static struct kobj_attribute ouichefs_gc_count_attr = __ATTR_RO(gc_count);
+
+static struct attribute *ouichefs_attrs[] = {
+	&ouichefs_free_blocks_attr.attr,
+	&ouichefs_commited_blocks_attr.attr,
+	&ouichefs_reserved_blocks_attr.attr,
+	&ouichefs_files_attr.attr,
+	&ouichefs_total_extents_attr.attr,
+	&ouichefs_avg_extent_size_attr.attr,
+	&ouichefs_max_file_size_attr.attr,
+	&ouichefs_fragmentation_attr.attr,
+	&ouichefs_reservation_window_attr.attr,
+	&ouichefs_gc_count_attr.attr,
+	NULL,
+};
+
+static struct attribute_group ouichefs_stats_attr_group = {
+	.attrs = ouichefs_attrs,
+};
+
+static struct kobj_type ouichefs_kobj_type = {
+	.sysfs_ops = &kobj_sysfs_ops,
+};
+
+static int ouichefs_init_stats(struct ouichefs_sb_info *sbi,
+			       const char *partition_name)
+{
+	int ret = kobject_init_and_add(&sbi->partition_kobj,
+				       &ouichefs_kobj_type, ouichefs_kobj, "%s",
+				       partition_name);
+
+	if (ret) {
+		goto out;
+	}
+
+	ret = sysfs_create_group(&sbi->partition_kobj,
+				 &ouichefs_stats_attr_group);
+	if (ret) {
+		goto out;
+	}
+	return 0;
+out:
+	kobject_put(&sbi->partition_kobj);
+	return ret;
+}
+
+static int ouichefs_remove_stats(struct ouichefs_sb_info *sbi)
+{
+	sysfs_remove_group(&sbi->partition_kobj, &ouichefs_stats_attr_group);
+	kobject_put(&sbi->partition_kobj);
+	return 0;
+}
+
+//end sysfs stats
+
 /*
  * Mount a ouiche_fs partition
  */
@@ -118,11 +305,25 @@ static struct dentry *ouichefs_mount(struct file_system_type *fs_type,
 
 	dentry =
 		mount_bdev(fs_type, flags, dev_name, data, ouichefs_fill_super);
-	if (IS_ERR(dentry))
+	if (IS_ERR(dentry)) {
 		pr_err("'%s' mount failure\n", dev_name);
-	else
-		pr_info("'%s' mount success\n", dev_name);
+		goto out_mount_failure;
+	}
 
+	pr_info("'%s' mount success\n", dev_name);
+
+	const struct super_block *sb = dentry->d_sb;
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+	const char *partition_name = kbasename(dev_name);
+	if (ouichefs_init_stats(sbi, partition_name)) {
+		pr_warn("Failed to initialize sysfs-stats for partition %s\n",
+			dev_name);
+		//no exit here since since mount was still successful and
+		// filesystem can be used
+	}
+
+	return dentry;
+out_mount_failure:
 	return dentry;
 }
 
@@ -131,6 +332,8 @@ static struct dentry *ouichefs_mount(struct file_system_type *fs_type,
  */
 static void ouichefs_kill_sb(struct super_block *sb)
 {
+	ouichefs_remove_stats(OUICHEFS_SB(sb));
+
 	kill_block_super(sb);
 
 	pr_info("unmounted disk\n");
@@ -150,33 +353,43 @@ static int __init ouichefs_init(void)
 	int ret = ouichefs_init_inode_cache();
 	if (ret) {
 		pr_err("inode cache creation failed\n");
-		goto err;
+		goto out;
 	}
 
 	ret = register_filesystem(&ouichefs_file_system_type);
 	if (ret) {
 		pr_err("register_filesystem() failed\n");
-		goto err_inode;
+		goto out_inode;
 	}
 
 	major = register_chrdev(0, "ouichefs", &ouichefs_ioctl_fops);
 
 	if (major < 0) {
 		ret = major;
-		goto err_inode;
+		goto out_inode;
+	}
+
+	//create /sys/ouichefs
+	ouichefs_kobj = kobject_create_and_add("ouichefs", NULL);
+	if (!ouichefs_kobj) {
+		ret = -ENOMEM;
+		goto out_ioctl;
 	}
 
 	pr_info("module loaded\n");
 	return 0;
-
-err_inode:
+out_ioctl:
+	unregister_chrdev(major, "ouichefs");
+out_inode:
 	ouichefs_destroy_inode_cache();
-err:
+out:
 	return ret;
 }
 
 static void __exit ouichefs_exit(void)
 {
+	kobject_put(ouichefs_kobj);
+
 	unregister_chrdev(major, "ouichefs");
 
 	const int ret = unregister_filesystem(&ouichefs_file_system_type);

@@ -24,7 +24,7 @@ struct ouichefs_extent;
 // #define OUICHEFS_MAX_FILESIZE
 // 	(OUICHEFS_MAX_EXTENTS * (1 << 32)) /* ~ 2048 GiB */
 
-#define OUICHEFS_MAX_FILESIZE ((loff_t) U32_MAX)
+#define OUICHEFS_MAX_FILESIZE ((loff_t)U32_MAX)
 enum {
 	OUICHEFS_EXTENT_TYPE_FOUND = 0,
 	OUICHEFS_EXTENT_TYPE_INSERT_AT_END,
@@ -89,8 +89,15 @@ struct ouichefs_sb_info {
 
 	uint32_t nr_free_inodes; /* Number of free inodes */
 	uint32_t nr_free_blocks; /* Number of free blocks */
+	uint32_t nr_committed_blocks;
+	uint32_t nr_reserved_blocks;
+	uint32_t nr_regular_files;
+	uint32_t nr_total_extents;
+	uint32_t accumulated_extents_size;
+	uint32_t max_file_size;
 
 	uint32_t gc_count;
+	struct kobject partition_kobj; //kobj for sysfs stats
 
 	unsigned long *ifree_bitmap; /* In-memory free inodes bitmap */
 	unsigned long *bfree_bitmap; /* In-memory free blocks bitmap */
@@ -129,9 +136,12 @@ extern const struct file_operations ouichefs_file_ops;
 extern const struct file_operations ouichefs_dir_ops;
 extern const struct address_space_operations ouichefs_aops;
 int ouichefs_truncate(struct inode *inode);
+extern uint32_t ouichefs_calculate_max_file_size(struct super_block *sb);
 
 /* Getters for superblock and inode */
 #define OUICHEFS_SB(sb) ((sb)->s_fs_info)
+#define OUICHEFS_SB_FROM_KOBJ(kobj) \
+	(container_of(kobj, struct ouichefs_sb_info, partition_kobj))
 #define OUICHEFS_INODE(inode) \
 	(container_of(inode, struct ouichefs_inode_info, vfs_inode))
 

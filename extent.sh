@@ -5,6 +5,9 @@
 MNT=${MNT:-/mnt/ouichefs}
 # block size in bytes
 BLOCK_SIZE=4096
+NR_BLOCKS=12800
+INITIAL_COMMITTED_BLOCKS=255
+DEFAULT_RESERVATION_WINDOW=8
 
 # How to setup this test:
 #
@@ -513,7 +516,7 @@ test_reservation() {
   fi
 
   # Use a single redirection to keep the file handle open across multiple writes
-  exec 3> "$file"
+  exec 3>"$file"
   trap 'exec 3>&-' RETURN
   dd if=/dev/zero bs="$((BLOCK_SIZE * 2))" count=1 >&3 2>/dev/null
   # small_file is still separate, it should "break" contiguity if not for reservation
@@ -566,7 +569,7 @@ test_reservation_released_on_close() {
   dmesg -C 2>/dev/null || true
 
   # Open, write one block, and keep it open via FD 3
-  exec 3> "$file"
+  exec 3>"$file"
   trap 'exec 3>&-' RETURN
   dd if=/dev/zero bs="$BLOCK_SIZE" count=1 >&3 2>/dev/null
 
@@ -739,7 +742,7 @@ test_gc_reclamation() {
       wait || true
       return 1
     fi
-    dd if=/dev/zero bs="$BLOCK_SIZE" count="$free_after" >&8 2>/dev/null || \
+    dd if=/dev/zero bs="$BLOCK_SIZE" count="$free_after" >&8 2>/dev/null ||
       dd if=/dev/zero bs="$BLOCK_SIZE" count=1 >&8 2>/dev/null || break
   done
   free_after=$(df -B"$BLOCK_SIZE" --output=avail "$MNT" | tail -n 1 | tr -d ' ')
@@ -796,6 +799,217 @@ test_gc_reclamation() {
   echo "GC reclaimed reservations (gc_count $initial_gc -> $final_gc)"
 }
 
+# Sysfs attrs exist and report the empty-partition baseline.
+test_stats_clean_state() {
+  local -A s=()
+  load_stats s || return 1
+
+  local attr
+  for attr in "${OUICHEFS_STAT_NAMES[@]}"; do
+    if [[ ! -f "${s[sysfs_path]}/$attr" ]]; then
+      pr_err "missing sysfs attribute ${s[sysfs_path]}/$attr"
+      return 1
+    fi
+  done
+
+  local expected_free=$((NR_BLOCKS - INITIAL_COMMITTED_BLOCKS))
+  assert_eq "clean free_blocks" "${s[free_blocks]}" "$expected_free" || return 1
+  assert_eq "clean commited_blocks" "${s[commited_blocks]}" "$INITIAL_COMMITTED_BLOCKS" || return 1
+  assert_eq "clean reserved_blocks" "${s[reserved_blocks]}" 0 || return 1
+  assert_eq "clean files" "${s[files]}" 0 || return 1
+  assert_eq "clean total_extents" "${s[total_extents]}" 0 || return 1
+  assert_eq "clean avg_extent_size" "${s[avg_extent_size]}" 0 || return 1
+  assert_eq "clean max_file_size" "${s[max_file_size]}" 0 || return 1
+  assert_eq "clean fragmentation" "${s[fragmentation]}" 0 || return 1
+  assert_block_accounting s || return 1
+}
+
+# reservation_window is read-write.
+test_stats_reservation_window() {
+  local -A s=()
+  load_stats s || return 1
+
+  local initial=${s[reservation_window]}
+  local new_window=16
+  if [[ "$initial" -eq 16 ]]; then
+    new_window=32
+  fi
+
+  if ! printf '%s\n' "$new_window" >"${s[sysfs_path]}/reservation_window"; then
+    pr_err "failed to write reservation_window"
+    return 1
+  fi
+  load_stats s || return 1
+  assert_eq "reservation_window after store" "${s[reservation_window]}" "$new_window" || return 1
+
+  printf '%s\n' "$initial" >"${s[sysfs_path]}/reservation_window"
+  load_stats s || return 1
+  assert_eq "reservation_window restored" "${s[reservation_window]}" "$initial" || return 1
+}
+
+# Small-file block accounting: create (−2 free), in-block append (unchanged), unlink (≥2 freed).
+test_stats_file_blocks() {
+  local -A s=()
+  load_stats s || return 1
+
+  local file="$MNT/stats_small"
+  cleanup_later "$file"
+
+  local expected_free=$((NR_BLOCKS - INITIAL_COMMITTED_BLOCKS))
+  local content="Hello stats!"
+  local content_len=${#content}
+  prf "$content" >"$file"
+
+  load_stats s || return 1
+  assert_eq "free_blocks after small file" "${s[free_blocks]}" "$((expected_free - 2))" || return 1
+  assert_eq "commited_blocks after small file" "${s[commited_blocks]}" "$((INITIAL_COMMITTED_BLOCKS + 2))" || return 1
+  assert_eq "reserved_blocks after close" "${s[reserved_blocks]}" 0 || return 1
+  assert_eq "files after small file" "${s[files]}" 1 || return 1
+  assert_eq "total_extents after small file" "${s[total_extents]}" 1 || return 1
+  assert_eq "avg_extent_size after small file" "${s[avg_extent_size]}" 100 || return 1
+  assert_eq "max_file_size after small file" "${s[max_file_size]}" "$content_len" || return 1
+  assert_eq "fragmentation after small file" "${s[fragmentation]}" 100 || return 1
+  assert_block_accounting s || return 1
+
+  local free_before=${s[free_blocks]}
+  local committed_before=${s[commited_blocks]}
+  prf "!" >>"$file"
+  load_stats s || return 1
+  assert_eq "free_blocks after in-block append" "${s[free_blocks]}" "$free_before" || return 1
+  assert_eq "commited_blocks after in-block append" "${s[commited_blocks]}" "$committed_before" || return 1
+  assert_eq "max_file_size after in-block append" "${s[max_file_size]}" "$((content_len + 1))" || return 1
+
+  free_before=${s[free_blocks]}
+  rm -f "$file"
+  load_stats s || return 1
+  local freed=$((${s[free_blocks]} - free_before))
+  if [[ "$freed" -lt 2 ]]; then
+    pr_err "expected at least 2 blocks freed on unlink, got $freed"
+    return 1
+  fi
+  assert_eq "blocks freed for small file" "$freed" 2 || return 1
+  assert_eq "free_blocks after delete" "${s[free_blocks]}" "$expected_free" || return 1
+  assert_eq "files after delete" "${s[files]}" 0 || return 1
+  assert_eq "max_file_size after delete" "${s[max_file_size]}" 0 || return 1
+  assert_block_accounting s || return 1
+}
+
+# reserved_blocks tracks the open-fd reservation window leftover; close releases it.
+test_stats_reserved_blocks() {
+  local -A s=()
+  load_stats s || return 1
+
+  local file="$MNT/stats_reserved"
+  cleanup_later "$file"
+  local expected_free=$((NR_BLOCKS - INITIAL_COMMITTED_BLOCKS))
+
+  printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+
+  exec 3>"$file"
+  trap 'exec 3>&-' RETURN
+  dd if=/dev/zero bs="$BLOCK_SIZE" count=1 >&3 2>/dev/null
+
+  load_stats s || return 1
+  assert_eq "reserved_blocks while open" "${s[reserved_blocks]}" "$DEFAULT_RESERVATION_WINDOW" || return 1
+  assert_eq "commited_blocks while open" "${s[commited_blocks]}" "$((INITIAL_COMMITTED_BLOCKS + 2))" || return 1
+  assert_eq "free_blocks while open" "${s[free_blocks]}" "$((expected_free - 2 - DEFAULT_RESERVATION_WINDOW))" || return 1
+  assert_block_accounting s || return 1
+
+  exec 3>&-
+  trap - RETURN
+
+  load_stats s || return 1
+  assert_eq "reserved_blocks after close" "${s[reserved_blocks]}" 0 || return 1
+  assert_eq "free_blocks after close" "${s[free_blocks]}" "$((expected_free - 2))" || return 1
+  assert_block_accounting s || return 1
+}
+
+# total_extents / avg_extent_size / fragmentation for contiguous and fragmented layouts.
+test_stats_extents() {
+  local -A s=()
+  load_stats s || return 1
+
+  local file="$MNT/stats_ext"
+  local other="$MNT/stats_ext_other"
+  cleanup_later "$file" "$other"
+
+  local -i multi_blocks=3
+  local -i multi_bytes=$((multi_blocks * BLOCK_SIZE))
+  local expected_free=$((NR_BLOCKS - INITIAL_COMMITTED_BLOCKS))
+
+  dd if=/dev/zero of="$file" bs="$multi_bytes" count=1 2>/dev/null
+  load_stats s || return 1
+  assert_eq "free_blocks after 3-block file" "${s[free_blocks]}" "$((expected_free - 1 - multi_blocks))" || return 1
+  assert_eq "files after 3-block file" "${s[files]}" 1 || return 1
+  assert_eq "total_extents after 3-block file" "${s[total_extents]}" 1 || return 1
+  assert_eq "avg_extent_size after 3-block file" "${s[avg_extent_size]}" "$((multi_blocks * 100))" || return 1
+  assert_eq "fragmentation after 3-block file" "${s[fragmentation]}" 100 || return 1
+  assert_eq "max_file_size after 3-block file" "${s[max_file_size]}" "$multi_bytes" || return 1
+
+  # Disable reservations so the spacer file sits on the next physical block and
+  # the append cannot coalesce into the first extent.
+  printf '%s\n' 0 >"${s[sysfs_path]}/reservation_window"
+  rm -f "$file"
+  dd if=/dev/zero of="$file" bs="$multi_bytes" count=1 2>/dev/null
+  dd if=/dev/zero of="$other" bs="$BLOCK_SIZE" count=1 2>/dev/null
+  dd if=/dev/zero of="$file" bs="$BLOCK_SIZE" seek="$multi_blocks" count=1 conv=notrunc 2>/dev/null
+  printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+
+  load_stats s || return 1
+  assert_eq "files with two files" "${s[files]}" 2 || return 1
+  # file: 2 extents (3+1), other: 1 extent
+  assert_eq "total_extents fragmented" "${s[total_extents]}" 3 || return 1
+  assert_eq "avg_extent_size fragmented" "${s[avg_extent_size]}" $((5 * 100 / 3)) || return 1
+  assert_eq "fragmentation fragmented" "${s[fragmentation]}" 150 || return 1
+  assert_eq "max_file_size after append" "${s[max_file_size]}" "$(((multi_blocks + 1) * BLOCK_SIZE))" || return 1
+  assert_block_accounting s || return 1
+}
+
+# max_file_size tracks the largest file and is recomputed when it is removed.
+test_stats_max_file_size() {
+  local -A s=()
+  load_stats s || return 1
+
+  local small="$MNT/stats_max_small"
+  local large="$MNT/stats_max_large"
+  cleanup_later "$small" "$large"
+
+  dd if=/dev/zero of="$small" bs=$((BLOCK_SIZE * 2)) count=1 2>/dev/null
+  load_stats s || return 1
+  assert_eq "max_file_size after small" "${s[max_file_size]}" "$((2 * BLOCK_SIZE))" || return 1
+
+  dd if=/dev/zero of="$large" bs=$((BLOCK_SIZE * 5)) count=1 2>/dev/null
+  load_stats s || return 1
+  assert_eq "max_file_size after large" "${s[max_file_size]}" "$((5 * BLOCK_SIZE))" || return 1
+
+  rm -f "$large"
+  load_stats s || return 1
+  assert_eq "max_file_size after removing largest" "${s[max_file_size]}" "$((2 * BLOCK_SIZE))" || return 1
+
+  rm -f "$small"
+  load_stats s || return 1
+  assert_eq "max_file_size after removing all" "${s[max_file_size]}" 0 || return 1
+}
+
+# Force a GC pass and verify gc_count in sysfs increases.
+test_stats_gc_count() {
+  local -A s=()
+  load_stats s || return 1
+  local -i initial_gc=${s[gc_count]}
+
+  if ! force_ouichefs_gc; then
+    pr_err "failed to force a GC pass"
+    return 1
+  fi
+
+  load_stats s || return 1
+  if [[ "${s[gc_count]}" -le "$initial_gc" ]]; then
+    pr_err "gc_count did not increase (initial=$initial_gc final=${s[gc_count]})"
+    return 1
+  fi
+  echo "gc_count $initial_gc -> ${s[gc_count]}"
+}
+
 #################
 # END TESTCASES #
 #################
@@ -808,6 +1022,162 @@ prf() {
 # prints an error
 pr_err() {
   echo "[ERROR] $1" >&2
+}
+
+OUICHEFS_STAT_NAMES=(
+  free_blocks
+  commited_blocks
+  reserved_blocks
+  files
+  total_extents
+  avg_extent_size
+  max_file_size
+  fragmentation
+  reservation_window
+  gc_count
+)
+
+# Resolve /sys/ouichefs/<partition> for the mounted test partition.
+ouichefs_sysfs_path() {
+  local dev
+  dev="$(findmnt -n -o SOURCE "$MNT")"
+  if [[ -z "$dev" ]]; then
+    pr_err "could not resolve SOURCE for $MNT"
+    return 1
+  fi
+  printf '%s\n' "/sys/ouichefs/$(basename "$dev")"
+}
+
+# Load all ouichefs sysfs stats into the nameref'd associative array.
+# Also sets stats[sysfs_path].
+load_stats() {
+  local -n stats_ref=$1
+  local sysfs_path name
+  sysfs_path="$(ouichefs_sysfs_path)" || return 1
+  stats_ref=()
+  stats_ref[sysfs_path]=$sysfs_path
+  for name in "${OUICHEFS_STAT_NAMES[@]}"; do
+    stats_ref[$name]=$(<"$sysfs_path/$name")
+  done
+}
+
+# Assert numeric equality with a label for the failure message.
+assert_eq() {
+  local label=$1
+  local actual=$2
+  local expected=$3
+  if [[ "$actual" -ne "$expected" ]]; then
+    pr_err "$label: expected $expected but got $actual"
+    return 1
+  fi
+}
+
+# Assert free + committed + reserved == NR_BLOCKS using a loaded stats array.
+assert_block_accounting() {
+  local -n stats_ref=$1
+  local sum=$((stats_ref[free_blocks] + stats_ref[commited_blocks] + stats_ref[reserved_blocks]))
+  if [[ "$sum" -ne "$NR_BLOCKS" ]]; then
+    pr_err "block accounting: free(${stats_ref[free_blocks]})+committed(${stats_ref[commited_blocks]})+reserved(${stats_ref[reserved_blocks]})=$sum, expected $NR_BLOCKS"
+    return 1
+  fi
+}
+
+# Fill the partition while reservation holders keep leftover windows, then
+# force an allocating write that must trigger GC. Used by test_stats_gc_count.
+force_ouichefs_gc() {
+  local device ioctl_test_bin
+  local file_prefix="$MNT/stats_gc_writer_"
+  local trigger_file="$MNT/stats_gc_trigger"
+  local filler_file="$MNT/stats_gc_filler"
+  local sync_dir stop_file
+  local -i num_writers=4
+  local -a writer_files=()
+  local -i i
+
+  if ! setup_ioctl_test device ioctl_test_bin; then
+    return 1
+  fi
+
+  sync_dir=$(mktemp -d /tmp/ouiche_stats_gc.XXXXXX)
+  stop_file="$sync_dir/stop"
+  cleanup_later "$sync_dir" "$trigger_file" "$filler_file"
+
+  if ! : >"$trigger_file" || ! : >"$filler_file"; then
+    pr_err "failed to create trigger/filler files"
+    return 1
+  fi
+
+  for ((i = 0; i < num_writers; i++)); do
+    local f="${file_prefix}$i"
+    writer_files+=("$f")
+    cleanup_later "$f"
+    (
+      exec 3>"$f"
+      dd if=/dev/zero bs="$BLOCK_SIZE" count=1 >&3 2>/dev/null || exit 1
+      while [[ ! -f "$stop_file" ]]; do
+        sleep 0.05
+      done
+      exec 3>&-
+    ) &
+  done
+
+  for f in "${writer_files[@]}"; do
+    local -i waits=0
+    while [[ ! -s "$f" ]]; do
+      waits+=1
+      if [[ "$waits" -gt 100 ]]; then
+        pr_err "writer never created $f"
+        touch "$stop_file"
+        wait || true
+        return 1
+      fi
+      sleep 0.05
+    done
+  done
+
+  local -i free_blocks
+  free_blocks=$(df -B"$BLOCK_SIZE" --output=avail "$MNT" | tail -n 1 | tr -d ' ')
+  if [[ -z "$free_blocks" || "$free_blocks" -le 0 ]]; then
+    pr_err "expected free blocks after writers, got '$free_blocks'"
+    touch "$stop_file"
+    wait || true
+    return 1
+  fi
+
+  exec 8>"$filler_file"
+  if ! dd if=/dev/zero bs=$((BLOCK_SIZE * free_blocks)) count=1 >&8 2>/dev/null; then
+    dd if=/dev/zero bs="$BLOCK_SIZE" count="$free_blocks" >&8 2>/dev/null || true
+  fi
+
+  local -i free_after drain_guard=0
+  while true; do
+    free_after=$(df -B"$BLOCK_SIZE" --output=avail "$MNT" | tail -n 1 | tr -d ' ')
+    : "${free_after:=0}"
+    [[ "$free_after" -le 0 ]] && break
+    drain_guard+=1
+    if [[ "$drain_guard" -gt 32 ]]; then
+      pr_err "could not drain free space (still $free_after blocks)"
+      exec 8>&-
+      touch "$stop_file"
+      wait || true
+      return 1
+    fi
+    dd if=/dev/zero bs="$BLOCK_SIZE" count="$free_after" >&8 2>/dev/null ||
+      dd if=/dev/zero bs="$BLOCK_SIZE" count=1 >&8 2>/dev/null || break
+  done
+
+  if ! dd if=/dev/zero of="$trigger_file" bs="$BLOCK_SIZE" count=1 conv=notrunc 2>/dev/null; then
+    pr_err "trigger write failed — GC did not reclaim reserved space"
+    exec 8>&-
+    touch "$stop_file"
+    wait || true
+    return 1
+  fi
+
+  exec 8>&-
+  touch "$stop_file"
+  wait || true
+  return 0
 }
 
 main "$@"

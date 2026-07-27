@@ -19,6 +19,26 @@
 #include "ouichefs.h"
 #include "bitmap.h"
 
+uint32_t ouichefs_calculate_max_file_size(struct super_block *sb)
+{
+	spin_lock(&sb->s_inode_list_lock);
+	uint32_t max_file_size = 0;
+	struct inode *inode;
+	int inode_count = 0;
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		if (!S_ISREG(inode->i_mode))
+			continue;
+
+		inode_count++;
+		if (inode->i_size > max_file_size) {
+			max_file_size = inode->i_size;
+		}
+	}
+	spin_unlock(&sb->s_inode_list_lock);
+
+	return max_file_size;
+}
+
 static int ouichefs_get_extent_of_logical_block(
 	const struct ouichefs_extent *extents, const uint32_t logical_block,
 	unsigned int *parent_extent_index, unsigned int *inner_extent_offset)
@@ -149,6 +169,7 @@ static int ouichefs_file_allocate_blocks(struct inode *inode,
 					 struct buffer_head *bh_result)
 {
 	struct super_block *sb = inode->i_sb;
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 	struct ouichefs_inode_info *inode_info = OUICHEFS_INODE(inode);
 	int ret = 0;
 	uint32_t bno;
@@ -201,6 +222,7 @@ static int ouichefs_file_allocate_blocks(struct inode *inode,
 			//allocate everything to reserve; there is realistically no limit
 			inode_info->i_reserved_count = nob;
 			inode_info->i_reserved_start = bno;
+			sbi->nr_reserved_blocks += nob;
 		}
 
 		//use reserve
@@ -209,6 +231,8 @@ static int ouichefs_file_allocate_blocks(struct inode *inode,
 		bno = inode_info->i_reserved_start;
 
 		inode_info->i_reserved_count -= nob;
+		sbi->nr_reserved_blocks -= nob;
+		sbi->nr_committed_blocks += nob;
 		inode_info->i_reserved_start += nob;
 
 		pr_info("Reserve of inode %lu is now %d blocks", inode->i_ino,
@@ -225,6 +249,7 @@ static int ouichefs_file_allocate_blocks(struct inode *inode,
 				parent_extent->count = cpu_to_le32(
 					le32_to_cpu(parent_extent->count) +
 					nob);
+				sbi->accumulated_extents_size += nob;
 				extent_initialized = 1;
 			}
 		}
@@ -233,6 +258,8 @@ static int ouichefs_file_allocate_blocks(struct inode *inode,
 				cpu_to_le32(bno);
 			index->extents[parent_extent_index].count =
 				cpu_to_le32(nob);
+			sbi->accumulated_extents_size += nob;
+			sbi->nr_total_extents += 1;
 		}
 
 		inode->i_blocks += nob;
@@ -470,6 +497,7 @@ static ssize_t ouichefs_write(struct file *file, const char __user *buf,
 	}
 
 	struct super_block *sb = inode->i_sb;
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 	// The logical index of the block to write for the current position
 	const sector_t iblock = *pos >> sb->s_blocksize_bits;
 
@@ -527,6 +555,10 @@ static ssize_t ouichefs_write(struct file *file, const char __user *buf,
 		if (*pos > inode->i_size) {
 			i_size_write(inode, *pos);
 			mark_inode_dirty(inode);
+
+			if (inode->i_size > sbi->max_file_size) {
+				sbi->max_file_size = inode->i_size;
+			}
 		}
 
 		// Mark the block as dirty
@@ -564,6 +596,8 @@ int ouichefs_release_reservations(const struct inode *inode)
 	if (ret)
 		return ret;
 
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(inode->i_sb);
+	sbi->nr_reserved_blocks -= inode_info->i_reserved_count;
 	inode_info->i_reserved_start = 0;
 	inode_info->i_reserved_count = 0;
 
@@ -623,12 +657,19 @@ int ouichefs_truncate(struct inode *inode)
 	for (size_t i = next_num_blocks; i < OUICHEFS_MAX_EXTENTS; ++i) {
 		const unsigned int count = le32_to_cpu(index->extents[i].count);
 
+		if (!count)
+			break;
+
 		// Iterate over all blocks in the extent
 		for (int j = 0; j < count; ++j) {
 			put_block(sbi,
 				  le32_to_cpu(index->extents[i].start) + j);
 			--inode->i_blocks;
+			sbi->nr_committed_blocks--;
 		}
+
+		sbi->nr_total_extents -= 1;
+		sbi->accumulated_extents_size -= count;
 
 		// 0 is the same in big and little endian
 		index->extents[i].start = 0;
@@ -639,6 +680,7 @@ int ouichefs_truncate(struct inode *inode)
 	brelse(bh);
 
 	mark_inode_dirty(inode);
+	sbi->max_file_size = ouichefs_calculate_max_file_size(sb);
 
 	return 0;
 

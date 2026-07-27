@@ -135,6 +135,9 @@ static void ouichefs_evict_inode(struct inode *inode)
 				unsigned int count = le32_to_cpu(
 					file_index->extents[i].count);
 
+				if (!count)
+					break;
+
 				// Iterate over all blocks in the extent
 				for (int j = 0; j < count; ++j) {
 					put_block(sbi,
@@ -143,6 +146,9 @@ static void ouichefs_evict_inode(struct inode *inode)
 								  .start) +
 							  j);
 				}
+
+				sbi->nr_total_extents--;
+				sbi->accumulated_extents_size -= count;
 			}
 		}
 
@@ -161,6 +167,10 @@ static void ouichefs_evict_inode(struct inode *inode)
 	}
 
 invalidate:
+	if (S_ISREG(inode->i_mode))
+		sbi->nr_regular_files--;
+	sbi->nr_committed_blocks -= inode->i_blocks; //index is already included
+
 	invalidate_inode_buffers(inode);
 	clear_inode(inode);
 
@@ -168,6 +178,8 @@ invalidate:
 		/* Free inode from bitmap */
 		put_inode(sbi, ino);
 	}
+
+	sbi->max_file_size = ouichefs_calculate_max_file_size(sb);
 }
 
 static int sync_sb_info(struct super_block *sb, int wait)
@@ -189,6 +201,11 @@ static int sync_sb_info(struct super_block *sb, int wait)
 	disk_sb->nr_bfree_blocks = cpu_to_le32(sbi->nr_bfree_blocks);
 	disk_sb->nr_free_inodes = cpu_to_le32(sbi->nr_free_inodes);
 	disk_sb->nr_free_blocks = cpu_to_le32(sbi->nr_free_blocks);
+	disk_sb->nr_regular_files = cpu_to_le32(sbi->nr_regular_files);
+	disk_sb->nr_total_extents = cpu_to_le32(sbi->nr_total_extents);
+	disk_sb->accumulated_extents_size =
+		cpu_to_le32(sbi->accumulated_extents_size);
+	disk_sb->max_file_size = cpu_to_le32(sbi->max_file_size);
 
 	mark_buffer_dirty(bh);
 	if (wait)
@@ -349,6 +366,12 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->nr_bfree_blocks = le32_to_cpu(csb->nr_bfree_blocks);
 	sbi->nr_free_inodes = le32_to_cpu(csb->nr_free_inodes);
 	sbi->nr_free_blocks = le32_to_cpu(csb->nr_free_blocks);
+	sbi->nr_regular_files = le32_to_cpu(csb->nr_regular_files);
+	sbi->nr_total_extents = le32_to_cpu(csb->nr_total_extents);
+	sbi->accumulated_extents_size =
+		le32_to_cpu(csb->accumulated_extents_size);
+	sbi->max_file_size = le32_to_cpu(csb->max_file_size);
+	sbi->nr_committed_blocks = sbi->nr_blocks - sbi->nr_free_blocks;
 	sb->s_fs_info = sbi;
 
 	brelse(bh);

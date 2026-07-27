@@ -74,27 +74,28 @@ static inline uint32_t ouichefs_alloc_contiguous(const struct super_block *sb,
 	const unsigned long size = sbi->nr_blocks;
 
 	unsigned long b, e;
-	unsigned long bno = 0, bno_size = 0;
+	unsigned long bno = 0, nob = 0;
 	for_each_set_bitrange(b, e, free_map, size) {
-		if (e - b > bno_size) {
+		if (e - b > nob) {
 			bno = b;
-			bno_size = e - b;
+			nob = e - b;
 
-			if (bno_size >= requested) {
+			if (nob >= requested) {
 				break;
 			}
 		}
 	}
 
-	bno_size = min_t(unsigned long, bno_size, requested);
+	nob = min_t(unsigned long, nob, requested);
 
-	if (bno_size) {
-		bitmap_clear(free_map, bno, bno_size);
-		sbi->nr_free_blocks -= bno_size;
+	if (nob) {
+		bitmap_clear(free_map, bno, nob);
+		sbi->nr_free_blocks -= nob;
+		pr_info("Allocated %lu blocks", nob);
 	}
 
 	*block = bno;
-	return bno_size;
+	return nob;
 }
 
 static inline int ouichefs_free_contiguous(const struct super_block *sb,
@@ -111,6 +112,7 @@ static inline int ouichefs_free_contiguous(const struct super_block *sb,
 
 	bitmap_set(free_map, bno, nob);
 	sbi->nr_free_blocks += nob;
+	pr_info("Freed %u blocks", nob);
 	return 0;
 }
 
