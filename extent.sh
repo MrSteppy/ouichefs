@@ -144,7 +144,7 @@ test_read_hole() {
   # index + 2 data blocks; hole is not physical. Extents: data, hole, data.
   load_stats s || return 1
   assert_eq "free_blocks after hole file" "${s[free_blocks]}" "$((base[free_blocks] - 3))" || return 1
-  assert_eq "commited_blocks after hole file" "${s[commited_blocks]}" "$((base[commited_blocks] + 3))" || return 1
+  assert_eq "committed_blocks after hole file" "${s[committed_blocks]}" "$((base[committed_blocks] + 3))" || return 1
   assert_eq "files after hole file" "${s[files]}" "$((base[files] + 1))" || return 1
   assert_eq "total_extents after hole file" "${s[total_extents]}" "$((base[total_extents] + 3))" || return 1
   assert_eq "max_file_size after hole file" "${s[max_file_size]}" "$(max_of "$expected_sz" "${base[max_file_size]}")" || return 1
@@ -207,7 +207,7 @@ test_read_with_hole() {
   # toward avg_extent_size via accumulated_extents_count.
   load_stats s || return 1
   assert_eq "free_blocks after sparse file" "${s[free_blocks]}" "$((base[free_blocks] - 3))" || return 1
-  assert_eq "commited_blocks after sparse file" "${s[commited_blocks]}" "$((base[commited_blocks] + 3))" || return 1
+  assert_eq "committed_blocks after sparse file" "${s[committed_blocks]}" "$((base[committed_blocks] + 3))" || return 1
   assert_eq "files after sparse file" "${s[files]}" "$((base[files] + 1))" || return 1
   assert_eq "total_extents after sparse file" "${s[total_extents]}" "$((base[total_extents] + 3))" || return 1
   assert_eq "max_file_size after sparse file" "${s[max_file_size]}" "$(max_of "$expected_sz" "${base[max_file_size]}")" || return 1
@@ -440,17 +440,17 @@ test_write_hole_max_extents() {
 
   local -A s=() base=()
   load_stats base || return 1
-  printf '%s\n' 0 >"${base[sysfs_path]}/reservation_window"
+  printf '%s\n' 0 >"${base[sysfs_path]}/reservation_size"
 
   # Layout: [D][H3][D] then (H1,D)*254 → 511 extents, one free slot.
   # Middle write into H3 needs shift_by=2 → ENOSPC.
   dd if=/dev/zero of="$file" bs="$BLOCK_SIZE" count=1 2>/dev/null || {
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_size"
     pr_err "failed to write leading data block"
     return 1
   }
   dd if=/dev/zero of="$file" bs="$BLOCK_SIZE" seek=4 count=1 conv=notrunc 2>/dev/null || {
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_size"
     pr_err "failed to create initial hole+trailing data"
     return 1
   }
@@ -460,7 +460,7 @@ test_write_hole_max_extents() {
   local -i cur_extents=3
   while [[ "$cur_extents" -lt "$target_extents" ]]; do
     dd if=/dev/zero of="$file" bs="$BLOCK_SIZE" seek="$next_block" count=1 conv=notrunc 2>/dev/null || {
-      printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_window"
+      printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_size"
       pr_err "failed to grow extent list at block $next_block"
       return 1
     }
@@ -469,23 +469,23 @@ test_write_hole_max_extents() {
   done
 
   load_stats s || {
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_size"
     return 1
   }
   assert_eq "extents before overflow write" "${s[total_extents]}" "$((base[total_extents] + target_extents))" || {
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_size"
     return 1
   }
 
   local -i expected_sz
   expected_sz=$(stat -c '%s' "$file")
   local -i extents_before=${s[total_extents]}
-  local -i committed_before=${s[commited_blocks]}
+  local -i committed_before=${s[committed_blocks]}
   local -i free_before=${s[free_blocks]}
 
   # Write one block into the middle of the leading 3-block hole (logical blk 2)
   if dd if=/dev/urandom of="$file" bs="$BLOCK_SIZE" seek=2 count=1 conv=notrunc 2>/dev/null; then
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_size"
     pr_err "write into hole should fail when max extents would be exceeded"
     return 1
   fi
@@ -493,7 +493,7 @@ test_write_hole_max_extents() {
   local actual_size
   actual_size=$(stat -c '%s' "$file")
   if [[ "$actual_size" -ne "$expected_sz" ]]; then
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_size"
     pr_err "Expected size $expected_sz after failed hole write, got $actual_size"
     return 1
   fi
@@ -501,37 +501,37 @@ test_write_hole_max_extents() {
   # Hole must still read as zeros
   if ! dd if="$file" bs="$BLOCK_SIZE" skip=2 count=1 2>/dev/null |
     cmp -s /dev/zero - --bytes="$BLOCK_SIZE"; then
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_size"
     pr_err "hole was modified despite failed write"
     return 1
   fi
 
   load_stats s || {
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_size"
     return 1
   }
   assert_eq "total_extents after failed overflow" "${s[total_extents]}" "$extents_before" || {
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_size"
     return 1
   }
-  assert_eq "commited_blocks after failed overflow" "${s[commited_blocks]}" "$committed_before" || {
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+  assert_eq "committed_blocks after failed overflow" "${s[committed_blocks]}" "$committed_before" || {
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_size"
     return 1
   }
   assert_eq "free_blocks after failed overflow" "${s[free_blocks]}" "$free_before" || {
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_size"
     return 1
   }
   assert_eq "max_file_size after failed overflow" "${s[max_file_size]}" "$expected_sz" || {
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_size"
     return 1
   }
   assert_block_accounting s || {
-    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+    printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_size"
     return 1
   }
 
-  printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+  printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_size"
 }
 
 # Verifies that a series of writes and reads to the same file correctly update and retrieve data.
@@ -1387,7 +1387,7 @@ test_stats_clean_state() {
 
   local expected_free=$((NR_BLOCKS - INITIAL_COMMITTED_BLOCKS))
   assert_eq "clean free_blocks" "${s[free_blocks]}" "$expected_free" || return 1
-  assert_eq "clean commited_blocks" "${s[commited_blocks]}" "$INITIAL_COMMITTED_BLOCKS" || return 1
+  assert_eq "clean committed_blocks" "${s[committed_blocks]}" "$INITIAL_COMMITTED_BLOCKS" || return 1
   assert_eq "clean reserved_blocks" "${s[reserved_blocks]}" 0 || return 1
   assert_eq "clean files" "${s[files]}" 0 || return 1
   assert_eq "clean total_extents" "${s[total_extents]}" 0 || return 1
@@ -1397,27 +1397,27 @@ test_stats_clean_state() {
   assert_block_accounting s || return 1
 }
 
-# reservation_window is read-write.
-test_stats_reservation_window() {
+# reservation_size is read-write.
+test_stats_reservation_size() {
   local -A s=()
   load_stats s || return 1
 
-  local initial=${s[reservation_window]}
+  local initial=${s[reservation_size]}
   local new_window=16
   if [[ "$initial" -eq 16 ]]; then
     new_window=32
   fi
 
-  if ! printf '%s\n' "$new_window" >"${s[sysfs_path]}/reservation_window"; then
-    pr_err "failed to write reservation_window"
+  if ! printf '%s\n' "$new_window" >"${s[sysfs_path]}/reservation_size"; then
+    pr_err "failed to write reservation_size"
     return 1
   fi
   load_stats s || return 1
-  assert_eq "reservation_window after store" "${s[reservation_window]}" "$new_window" || return 1
+  assert_eq "reservation_size after store" "${s[reservation_size]}" "$new_window" || return 1
 
-  printf '%s\n' "$initial" >"${s[sysfs_path]}/reservation_window"
+  printf '%s\n' "$initial" >"${s[sysfs_path]}/reservation_size"
   load_stats s || return 1
-  assert_eq "reservation_window restored" "${s[reservation_window]}" "$initial" || return 1
+  assert_eq "reservation_size restored" "${s[reservation_size]}" "$initial" || return 1
 }
 
 # Small-file block accounting: create (−2 free), in-block append (unchanged), unlink (≥2 freed).
@@ -1434,7 +1434,7 @@ test_stats_file_blocks() {
 
   load_stats s || return 1
   assert_eq "free_blocks after small file" "${s[free_blocks]}" "$((base[free_blocks] - 2))" || return 1
-  assert_eq "commited_blocks after small file" "${s[commited_blocks]}" "$((base[commited_blocks] + 2))" || return 1
+  assert_eq "committed_blocks after small file" "${s[committed_blocks]}" "$((base[committed_blocks] + 2))" || return 1
   assert_eq "reserved_blocks after close" "${s[reserved_blocks]}" 0 || return 1
   assert_eq "files after small file" "${s[files]}" "$((base[files] + 1))" || return 1
   assert_eq "total_extents after small file" "${s[total_extents]}" "$((base[total_extents] + 1))" || return 1
@@ -1446,11 +1446,11 @@ test_stats_file_blocks() {
   assert_block_accounting s || return 1
 
   local free_before=${s[free_blocks]}
-  local committed_before=${s[commited_blocks]}
+  local committed_before=${s[committed_blocks]}
   prf "!" >>"$file"
   load_stats s || return 1
   assert_eq "free_blocks after in-block append" "${s[free_blocks]}" "$free_before" || return 1
-  assert_eq "commited_blocks after in-block append" "${s[commited_blocks]}" "$committed_before" || return 1
+  assert_eq "committed_blocks after in-block append" "${s[committed_blocks]}" "$committed_before" || return 1
   assert_eq "max_file_size after in-block append" "${s[max_file_size]}" "$(max_of "$((content_len + 1))" "${base[max_file_size]}")" || return 1
 
   free_before=${s[free_blocks]}
@@ -1476,7 +1476,7 @@ test_stats_reserved_blocks() {
   local file="$MNT/stats_reserved"
   cleanup_later "$file"
 
-  printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_window"
+  printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${base[sysfs_path]}/reservation_size"
 
   exec 3>"$file"
   trap 'exec 3>&-' RETURN
@@ -1484,7 +1484,7 @@ test_stats_reserved_blocks() {
 
   load_stats s || return 1
   assert_eq "reserved_blocks while open" "${s[reserved_blocks]}" "$DEFAULT_RESERVATION_WINDOW" || return 1
-  assert_eq "commited_blocks while open" "${s[commited_blocks]}" "$((base[commited_blocks] + 2))" || return 1
+  assert_eq "committed_blocks while open" "${s[committed_blocks]}" "$((base[committed_blocks] + 2))" || return 1
   assert_eq "free_blocks while open" "${s[free_blocks]}" "$((base[free_blocks] - 2 - DEFAULT_RESERVATION_WINDOW))" || return 1
   assert_block_accounting s || return 1
 
@@ -1522,12 +1522,12 @@ test_stats_extents() {
 
   # Disable reservations so the spacer file sits on the next physical block and
   # the append cannot coalesce into the first extent.
-  printf '%s\n' 0 >"${s[sysfs_path]}/reservation_window"
+  printf '%s\n' 0 >"${s[sysfs_path]}/reservation_size"
   rm -f "$file"
   dd if=/dev/zero of="$file" bs="$multi_bytes" count=1 2>/dev/null
   dd if=/dev/zero of="$other" bs="$BLOCK_SIZE" count=1 2>/dev/null
   dd if=/dev/zero of="$file" bs="$BLOCK_SIZE" seek="$multi_blocks" count=1 conv=notrunc 2>/dev/null
-  printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_window"
+  printf '%s\n' "$DEFAULT_RESERVATION_WINDOW" >"${s[sysfs_path]}/reservation_size"
 
   load_stats s || return 1
   assert_eq "files with two files" "${s[files]}" "$((base[files] + 2))" || return 1
@@ -1570,11 +1570,11 @@ test_stats_max_file_size() {
   assert_eq "max_file_size after removing all" "${s[max_file_size]}" "${base[max_file_size]}" || return 1
 }
 
-# Force a GC pass and verify gc_count in sysfs increases.
-test_stats_gc_count() {
+# Force a GC pass and verify gc_runs in sysfs increases.
+test_stats_gc_runs() {
   local -A s=()
   load_stats s || return 1
-  local -i initial_gc=${s[gc_count]}
+  local -i initial_gc=${s[gc_runs]}
 
   if ! force_ouichefs_gc; then
     pr_err "failed to force a GC pass"
@@ -1582,11 +1582,11 @@ test_stats_gc_count() {
   fi
 
   load_stats s || return 1
-  if [[ "${s[gc_count]}" -le "$initial_gc" ]]; then
-    pr_err "gc_count did not increase (initial=$initial_gc final=${s[gc_count]})"
+  if [[ "${s[gc_runs]}" -le "$initial_gc" ]]; then
+    pr_err "gc_runs did not increase (initial=$initial_gc final=${s[gc_runs]})"
     return 1
   fi
-  echo "gc_count $initial_gc -> ${s[gc_count]}"
+  echo "gc_runs $initial_gc -> ${s[gc_runs]}"
 }
 
 #################
@@ -1605,15 +1605,15 @@ pr_err() {
 
 OUICHEFS_STAT_NAMES=(
   free_blocks
-  commited_blocks
+  committed_blocks
   reserved_blocks
   files
   total_extents
   avg_extent_size
   max_file_size
   fragmentation
-  reservation_window
-  gc_count
+  reservation_size
+  gc_runs
 )
 
 # Resolve /sys/ouichefs/<partition> for the mounted test partition.
@@ -1834,7 +1834,7 @@ _test_write_into_hole() {
     # Baseline after sparse create: index + 2 data, extents data|hole|data
     load_stats s || return 1
     assert_eq "$position/$size_label free after create" "${s[free_blocks]}" "$((base[free_blocks] - 3))" || return 1
-    assert_eq "$position/$size_label committed after create" "${s[commited_blocks]}" "$((base[commited_blocks] + 3))" || return 1
+    assert_eq "$position/$size_label committed after create" "${s[committed_blocks]}" "$((base[committed_blocks] + 3))" || return 1
     assert_eq "$position/$size_label extents after create" "${s[total_extents]}" "$((base[total_extents] + 3))" || return 1
     assert_eq "$position/$size_label files after create" "${s[files]}" "$((base[files] + 1))" || return 1
     assert_eq "$position/$size_label max_file_size after create" "${s[max_file_size]}" "$(max_of "$expected_sz" "${base[max_file_size]}")" || return 1
@@ -1865,7 +1865,7 @@ _test_write_into_hole() {
     shift_by=$(hole_extent_delta "$hole_blocks" "$off" "$expect_alloc")
 
     local -i extents_before=${s[total_extents]}
-    local -i committed_before=${s[commited_blocks]}
+    local -i committed_before=${s[committed_blocks]}
     local -i free_before=${s[free_blocks]}
     local -i files_now=${s[files]}
     local -i expect_extents=$((extents_before + shift_by))
@@ -1949,7 +1949,7 @@ _test_write_into_hole() {
 
     load_stats s || return 1
     assert_eq "$position/$size_label free after write" "${s[free_blocks]}" "$expect_free" || return 1
-    assert_eq "$position/$size_label committed after write" "${s[commited_blocks]}" "$expect_committed" || return 1
+    assert_eq "$position/$size_label committed after write" "${s[committed_blocks]}" "$expect_committed" || return 1
     assert_eq "$position/$size_label extents after write" "${s[total_extents]}" "$expect_extents" || return 1
     assert_eq "$position/$size_label max_file_size after write" "${s[max_file_size]}" "$(max_of "$expected_sz" "${base[max_file_size]}")" || return 1
     assert_eq "$position/$size_label fragmentation after write" "${s[fragmentation]}" "$expect_frag" || return 1
@@ -1966,15 +1966,15 @@ _test_write_into_hole() {
 # Assert free + committed + reserved == NR_BLOCKS using a loaded stats array.
 assert_block_accounting() {
   local -n stats_ref=$1
-  local sum=$((stats_ref[free_blocks] + stats_ref[commited_blocks] + stats_ref[reserved_blocks]))
+  local sum=$((stats_ref[free_blocks] + stats_ref[committed_blocks] + stats_ref[reserved_blocks]))
   if [[ "$sum" -ne "$NR_BLOCKS" ]]; then
-    pr_err "block accounting: free(${stats_ref[free_blocks]})+committed(${stats_ref[commited_blocks]})+reserved(${stats_ref[reserved_blocks]})=$sum, expected $NR_BLOCKS"
+    pr_err "block accounting: free(${stats_ref[free_blocks]})+committed(${stats_ref[committed_blocks]})+reserved(${stats_ref[reserved_blocks]})=$sum, expected $NR_BLOCKS"
     return 1
   fi
 }
 
 # Fill the partition while reservation holders keep leftover windows, then
-# force an allocating write that must trigger GC. Used by test_stats_gc_count.
+# force an allocating write that must trigger GC. Used by test_stats_gc_runs.
 force_ouichefs_gc() {
   local device ioctl_test_bin
   local file_prefix="$MNT/stats_gc_writer_"

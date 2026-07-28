@@ -177,8 +177,8 @@ static ssize_t free_blocks_show(struct kobject *kobj,
 
 static struct kobj_attribute ouichefs_free_blocks_attr = __ATTR_RO(free_blocks);
 
-static ssize_t commited_blocks_show(struct kobject *kobj,
-				    struct kobj_attribute *attr, char *buf)
+static ssize_t committed_blocks_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
 {
 	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
 	ouichefs_stats_warn_on_sanity_fail(sbi);
@@ -186,7 +186,7 @@ static ssize_t commited_blocks_show(struct kobject *kobj,
 }
 
 static struct kobj_attribute ouichefs_commited_blocks_attr =
-	__ATTR_RO(commited_blocks);
+	__ATTR_RO(committed_blocks);
 
 static ssize_t reserved_blocks_show(struct kobject *kobj,
 				    struct kobj_attribute *attr, char *buf)
@@ -253,15 +253,15 @@ static ssize_t fragmentation_show(struct kobject *kobj,
 static struct kobj_attribute ouichefs_fragmentation_attr =
 	__ATTR_RO(fragmentation);
 
-static ssize_t reservation_window_show(struct kobject *kobj,
-				       struct kobj_attribute *attr, char *buf)
+static ssize_t reservation_size_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf, "%u\n", reservation_size);
 }
 
-static ssize_t reservation_window_store(struct kobject *kobj,
-					struct kobj_attribute *attr,
-					const char *buf, const size_t count)
+static ssize_t reservation_size_store(struct kobject *kobj,
+				      struct kobj_attribute *attr,
+				      const char *buf, const size_t count)
 {
 	if (kstrtou32(buf, 0, &reservation_size)) {
 		pr_err("Failed to parse reservation window\n");
@@ -270,16 +270,16 @@ static ssize_t reservation_window_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute ouichefs_reservation_window_attr =
-	__ATTR_RW(reservation_window);
+	__ATTR_RW(reservation_size);
 
-static ssize_t gc_count_show(struct kobject *kobj, struct kobj_attribute *attr,
-			     char *buf)
+static ssize_t gc_runs_show(struct kobject *kobj, struct kobj_attribute *attr,
+			    char *buf)
 {
 	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
 	return sysfs_emit(buf, "%u\n", sbi->gc_count);
 }
 
-static struct kobj_attribute ouichefs_gc_count_attr = __ATTR_RO(gc_count);
+static struct kobj_attribute ouichefs_gc_count_attr = __ATTR_RO(gc_runs);
 
 static struct attribute *ouichefs_attrs[] = {
 	&ouichefs_free_blocks_attr.attr,
