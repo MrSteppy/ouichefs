@@ -20,8 +20,20 @@ module_param(reservation_size, uint, 0644);
 MODULE_PARM_DESC(reservation_size,
 		 "Reservation size for the contiguous block allocator");
 
+uint32_t fragmentation_threshold = 400;
+module_param(fragmentation_threshold, uint, 0644);
+MODULE_PARM_DESC(fragmentation_threshold,
+		 "Fragmentation threshold for the contiguous block allocator");
+
 static int major;
 static struct kobject *ouichefs_kobj;
+
+uint32_t calculate_fragmentation(const struct ouichefs_sb_info *sbi)
+{
+	return sbi->nr_regular_files ?
+		       sbi->nr_total_extents * 100 / sbi->nr_regular_files :
+		       0;
+}
 
 // ReSharper disable once CppParameterNeverUsed
 static long ouichefs_unlocked_ioctl(struct file *f,
@@ -29,6 +41,7 @@ static long ouichefs_unlocked_ioctl(struct file *f,
 				    const unsigned long buf)
 {
 	int ret = 0;
+	struct file *file;
 	if (request_nr == OUICHEFS_IOC_GET_EXTENTS) {
 		unsigned int kernel_fd;
 
@@ -38,7 +51,7 @@ static long ouichefs_unlocked_ioctl(struct file *f,
 			return -EFAULT;
 		}
 
-		struct file *file = fget(kernel_fd);
+		file = fget(kernel_fd);
 		if (!file) {
 			pr_err("Failed to open file\n");
 			return -EBADF;
@@ -95,13 +108,43 @@ static long ouichefs_unlocked_ioctl(struct file *f,
 		brelse(bh_index);
 		fput(file);
 		return 0;
-
-out_fput:
-		fput(file);
-		return ret;
 	}
 
+	if (request_nr == OUICHEFS_IOC_DEFRAG_FILE) {
+		unsigned int kernel_fd;
+		if (copy_from_user(&kernel_fd, (unsigned int __user *)buf,
+				   sizeof(kernel_fd))) {
+			pr_err("Failed to read file descriptor from userspace\n");
+			return -EFAULT;
+		}
+
+		file = fget(kernel_fd);
+		if (!file) {
+			pr_err("Failed to open file\n");
+			return -EBADF;
+		}
+
+		//ensure the file is a ouichefs file
+		if (file->f_op != &ouichefs_file_ops) {
+			pr_err("File is not a ouichefs file\n");
+			ret = -EINVAL;
+			return ret;
+		}
+
+		struct inode *inode = file->f_inode;
+		ret = ouichefs_file_defragment(inode);
+		if (ret) {
+			pr_err("Failed to defragment file\n");
+			goto out_fput;
+		}
+
+		fput(file);
+		return 0;
+	}
 	return -ENOTTY;
+out_fput:
+	fput(file);
+	return ret;
 }
 
 static struct file_operations ouichefs_ioctl_fops = {
@@ -203,10 +246,7 @@ static ssize_t fragmentation_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
 	const struct ouichefs_sb_info *sbi = OUICHEFS_SB_FROM_KOBJ(kobj);
-	const uint32_t fragmentation =
-		sbi->nr_regular_files ?
-			sbi->nr_total_extents * 100 / sbi->nr_regular_files :
-			0;
+	const uint32_t fragmentation = calculate_fragmentation(sbi);
 	return sysfs_emit(buf, "%u\n", fragmentation);
 }
 

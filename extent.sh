@@ -274,6 +274,92 @@ test_write_truncate_longer() {
   fi
 }
 
+# Verifies that shrinking a file with truncate(2) actually deallocates blocks.
+# A file written sequentially lives in a single extent, so the new end of file
+# falls inside that extent and only its tail may be freed.
+test_truncate_smaller_frees_blocks() {
+  local file="$MNT/trunc_small"
+  cleanup_later "$file"
+
+  local -i initial_blocks=20
+  local -i new_size=8097
+  # ceil(8097 / BLOCK_SIZE) data blocks + the index block
+  local -i expected_blocks=$((((new_size + BLOCK_SIZE - 1) / BLOCK_SIZE) + 1))
+
+  dd if=/dev/urandom of="$file" bs="$BLOCK_SIZE" count="$initial_blocks" 2>/dev/null
+
+  local -i blocks_before
+  blocks_before=$(stat -c '%b' "$file")
+  if [[ "$blocks_before" -ne $((initial_blocks + 1)) ]]; then
+    pr_err "Expected $((initial_blocks + 1)) blocks before truncate, got $blocks_before"
+    return 1
+  fi
+
+  truncate -s "$new_size" "$file"
+
+  local -i actual_size blocks_after
+  actual_size=$(stat -c '%s' "$file")
+  blocks_after=$(stat -c '%b' "$file")
+
+  if [[ "$actual_size" -ne "$new_size" ]]; then
+    pr_err "Expected size $new_size after truncate, got $actual_size"
+    return 1
+  fi
+
+  if [[ "$blocks_after" -ne "$expected_blocks" ]]; then
+    pr_err "Truncation smaller mismatch. Size: $actual_size, Blocks: $blocks_before -> $blocks_after (expected $expected_blocks)"
+    return 1
+  fi
+
+  # The surviving data must be untouched
+  local -i tail_len=$((new_size - BLOCK_SIZE))
+  if ! dd if="$file" bs=1 skip="$BLOCK_SIZE" count="$tail_len" 2>/dev/null |
+    wc -c | grep -qx "$tail_len"; then
+    pr_err "Could not read back $tail_len bytes after truncate"
+    return 1
+  fi
+}
+
+# Verifies that truncating to a size inside a hole releases the trailing extents
+# without touching the surviving hole blocks.
+test_truncate_smaller_multi_extent() {
+  local file="$MNT/trunc_multi"
+  cleanup_later "$file"
+
+  # data block 0, hole blocks 1-2, data block 3 -> three extents
+  prf "head" >"$file"
+  prf "tail" | dd of="$file" bs=1 seek=$((BLOCK_SIZE * 3)) conv=notrunc 2>/dev/null
+
+  local -i blocks_before
+  blocks_before=$(stat -c '%b' "$file")
+
+  # keep block 0 and the first hole block only
+  local -i new_size=$((BLOCK_SIZE * 2))
+  truncate -s "$new_size" "$file"
+
+  local -i actual_size blocks_after
+  actual_size=$(stat -c '%s' "$file")
+  blocks_after=$(stat -c '%b' "$file")
+
+  if [[ "$actual_size" -ne "$new_size" ]]; then
+    pr_err "Expected size $new_size after truncate, got $actual_size"
+    return 1
+  fi
+
+  # only block 0 is a real data block, plus the index block
+  if [[ "$blocks_after" -ne 2 ]]; then
+    pr_err "Expected 2 blocks after truncate, got $blocks_after (was $blocks_before)"
+    return 1
+  fi
+
+  local actual
+  actual=$(dd if="$file" bs=1 count=4 2>/dev/null)
+  if [[ "$actual" != "head" ]]; then
+    pr_err "Expected 'head' after truncate, got '$actual'"
+    return 1
+  fi
+}
+
 # Verifies that appending data to an existing file correctly updates the content and preserves previous data.
 test_write_append() {
   local file="$MNT/file"
@@ -507,6 +593,8 @@ test_large_sequential_file() {
 
 # Helper to setup ioctl test environment (mknod, compile C tool).
 # Sets up the device node and compiles the helper binary.
+# Usage: $bin <file|open fd> <ctl device> [defrag]
+# Without a third argument the binary issues OUICHEFS_IOC_GET_EXTENTS.
 setup_ioctl_test() {
   local -n device_ref=$1
   local -n bin_ref=$2
@@ -545,8 +633,12 @@ setup_ioctl_test() {
 int main(int argc, char **argv)
 {
 	int ctl, fd;
+	unsigned long request = OUICHEFS_IOC_GET_EXTENTS;
 
 	if (argc < 3) return 1;
+
+	if (argc > 3 && argv[3][0] == '\''d'\'')
+		request = OUICHEFS_IOC_DEFRAG_FILE;
 
 	/* If first arg is a number, treat it as an open FD; otherwise open as filename */
 	if (argv[1][0] >= '\''0'\'' && argv[1][0] <= '\''9'\'') {
@@ -567,7 +659,7 @@ int main(int argc, char **argv)
 	}
 
 	/* kernel uses copy_from_user → pass &fd */
-	if (ioctl(ctl, OUICHEFS_IOC_GET_EXTENTS, &fd) < 0) {
+	if (ioctl(ctl, request, &fd) < 0) {
 		perror("ioctl");
 		close(ctl);
 		if (argv[1][0] < '\''0'\'' || argv[1][0] > '\''9'\'') close(fd);
@@ -718,6 +810,268 @@ test_contiguous_allocation() {
   fi
 
   echo "Confirmed: large file is allocated in $n_ext contiguous extent(s)"
+}
+
+# Verifies that defragmentation merges the extents of a fragmented sparse file.
+#
+# Two files are written alternately so that file B splits file A's physical
+# runs; A additionally gets a hole. Every write closes its fd, otherwise A's
+# leftover reservation window would absorb B's allocation and A would stay
+# contiguous. Layout of A:
+#
+#   [data 2][data 1][hole 1][data 1]              → 4 extents
+#   defrag: the two data runs are copied together → 3 extents
+#            [data 3][hole 1][data 1]
+#
+# The hole stops the merge, so the trailing data run stays its own extent.
+test_defrag_fragmented_file() {
+  local device ioctl_test_bin
+  local file_a="$MNT/defrag_a"
+  local file_b="$MNT/defrag_b"
+  local pattern="/tmp/ouiche_defrag_pat"
+  local ref="/tmp/ouiche_defrag_ref"
+  local got="/tmp/ouiche_defrag_got"
+  cleanup_later "$file_a" "$file_b" "$pattern" "$ref" "$got"
+
+  local -A base=() s=()
+  load_stats base || return 1
+
+  if ! setup_ioctl_test device ioctl_test_bin; then
+    return 1
+  fi
+
+  # 4 distinct data blocks so a defrag that loses or reorders data is caught
+  dd if=/dev/urandom of="$pattern" bs="$BLOCK_SIZE" count=4 2>/dev/null
+
+  # A: logical blocks 0-1
+  dd if="$pattern" of="$file_a" bs=$((2 * BLOCK_SIZE)) count=1 2>/dev/null || {
+    pr_err "failed to write first two blocks of A"
+    return 1
+  }
+  # B: takes the blocks right behind A, breaking A's contiguity
+  dd if=/dev/zero of="$file_b" bs="$BLOCK_SIZE" count=1 2>/dev/null || {
+    pr_err "failed to write B"
+    return 1
+  }
+  # A: logical block 2, now in a second physical run
+  dd if="$pattern" of="$file_a" bs="$BLOCK_SIZE" skip=2 seek=2 count=1 conv=notrunc 2>/dev/null || {
+    pr_err "failed to append third block of A"
+    return 1
+  }
+  # A: logical block 4, leaving block 3 as a hole
+  dd if="$pattern" of="$file_a" bs="$BLOCK_SIZE" skip=3 seek=4 count=1 conv=notrunc 2>/dev/null || {
+    pr_err "failed to write A past the hole"
+    return 1
+  }
+
+  local -i expected_sz=$((5 * BLOCK_SIZE))
+  local actual_size
+  actual_size=$(stat -c '%s' "$file_a")
+  if [[ "$actual_size" -ne "$expected_sz" ]]; then
+    pr_err "Expected size $expected_sz for A, got $actual_size"
+    return 1
+  fi
+
+  local -i n_ext
+  n_ext=$(count_file_extents "$file_a" "$device" "$ioctl_test_bin") || return 1
+  if [[ "$n_ext" -ne 4 ]]; then
+    pr_err "Expected 4 extents for the fragmented file, got $n_ext"
+    dmesg | grep 'start=' || true
+    return 1
+  fi
+
+  # A contributes 4 extents, B a single one
+  local -i expect_files=$((base[files] + 2))
+  local -i expect_extents=$((base[total_extents] + 5))
+  load_stats s || return 1
+  assert_eq "files before defrag" "${s[files]}" "$expect_files" || return 1
+  assert_eq "total_extents before defrag" "${s[total_extents]}" "$expect_extents" || return 1
+  assert_eq "fragmentation before defrag" "${s[fragmentation]}" "$((expect_extents * 100 / expect_files))" || return 1
+
+  if ! "$ioctl_test_bin" "$file_a" "$device" defrag; then
+    pr_err "defrag ioctl failed"
+    return 1
+  fi
+
+  n_ext=$(count_file_extents "$file_a" "$device" "$ioctl_test_bin") || return 1
+  if [[ "$n_ext" -ne 3 ]]; then
+    pr_err "Expected 3 extents after defrag, got $n_ext"
+    dmesg | grep 'start=' || true
+    return 1
+  fi
+
+  # The two data runs of A collapsed into one; B is untouched.
+  expect_extents=$((base[total_extents] + 4))
+  load_stats s || return 1
+  assert_eq "files after defrag" "${s[files]}" "$expect_files" || return 1
+  assert_eq "total_extents after defrag" "${s[total_extents]}" "$expect_extents" || return 1
+  assert_eq "fragmentation after defrag" "${s[fragmentation]}" "$((expect_extents * 100 / expect_files))" || return 1
+
+  actual_size=$(stat -c '%s' "$file_a")
+  if [[ "$actual_size" -ne "$expected_sz" ]]; then
+    pr_err "Expected size $expected_sz after defrag, got $actual_size"
+    return 1
+  fi
+
+  # Reference: blocks 0-2 of the pattern, a zero-filled block, then block 3.
+  dd if="$pattern" of="$ref" bs="$BLOCK_SIZE" count=3 2>/dev/null
+  dd if="$pattern" of="$ref" bs="$BLOCK_SIZE" skip=3 seek=4 count=1 conv=notrunc 2>/dev/null
+  if ! dd if="$file_a" of="$got" bs="$BLOCK_SIZE" 2>/dev/null; then
+    pr_err "failed to read A back after defrag"
+    return 1
+  fi
+  if ! cmp -s "$ref" "$got"; then
+    pr_err "content of A changed during defrag"
+    return 1
+  fi
+
+  echo "Confirmed: defrag reduced A from 4 to $n_ext extent(s)"
+}
+
+# Verifies that a fully mergeable layout reaches a fragmentation of 400 and that
+# defragmentation brings it back down to 100.
+#
+# A and B are appended to alternately, one block at a time, and every write
+# closes its fd so the leftover reservation window is released. Each append
+# therefore lands behind the other file's newest block and has to start a new
+# extent:
+#
+#   A: [1][1][1][1]   B: [1][1][1][1]   → 8 extents / 2 files → fragmentation 400
+#
+# No holes are involved, so nothing stops the merge: each file collapses into a
+# single extent → 2 extents / 2 files → fragmentation 100.
+test_defrag_mergeable_fragmentation() {
+  local device ioctl_test_bin
+  local file_a="$MNT/frag400_a"
+  local file_b="$MNT/frag400_b"
+  local pattern="/tmp/ouiche_frag400_pat"
+  local ref_a="/tmp/ouiche_frag400_ref_a"
+  local ref_b="/tmp/ouiche_frag400_ref_b"
+  local got="/tmp/ouiche_frag400_got"
+  cleanup_later "$file_a" "$file_b" "$pattern" "$ref_a" "$ref_b" "$got"
+
+  local -A base=() s=()
+  load_stats base || return 1
+
+  if ! setup_ioctl_test device ioctl_test_bin; then
+    return 1
+  fi
+
+  # One extent per block, so 4 blocks per file give the 8 extents we want.
+  local -i blocks_per_file=4
+  local -i total_blocks=$((2 * blocks_per_file))
+  dd if=/dev/urandom of="$pattern" bs="$BLOCK_SIZE" count="$total_blocks" 2>/dev/null
+  : >"$ref_a"
+  : >"$ref_b"
+
+  # A takes the even pattern blocks, B the odd ones; the references are built
+  # from the same blocks so a defrag that reorders data is caught later on.
+  local -i i
+  for ((i = 0; i < blocks_per_file; i++)); do
+    if ! dd if="$pattern" of="$file_a" bs="$BLOCK_SIZE" skip=$((2 * i)) seek="$i" count=1 conv=notrunc 2>/dev/null ||
+      ! dd if="$pattern" of="$ref_a" bs="$BLOCK_SIZE" skip=$((2 * i)) seek="$i" count=1 conv=notrunc 2>/dev/null; then
+      pr_err "failed to append block $i of A"
+      return 1
+    fi
+    if ! dd if="$pattern" of="$file_b" bs="$BLOCK_SIZE" skip=$((2 * i + 1)) seek="$i" count=1 conv=notrunc 2>/dev/null ||
+      ! dd if="$pattern" of="$ref_b" bs="$BLOCK_SIZE" skip=$((2 * i + 1)) seek="$i" count=1 conv=notrunc 2>/dev/null; then
+      pr_err "failed to append block $i of B"
+      return 1
+    fi
+  done
+
+  local -i expected_sz=$((blocks_per_file * BLOCK_SIZE))
+  local actual_size
+  local f
+  for f in "$file_a" "$file_b"; do
+    actual_size=$(stat -c '%s' "$f")
+    if [[ "$actual_size" -ne "$expected_sz" ]]; then
+      pr_err "Expected size $expected_sz for $f, got $actual_size"
+      return 1
+    fi
+  done
+
+  local -i n_ext_a n_ext_b
+  n_ext_a=$(count_file_extents "$file_a" "$device" "$ioctl_test_bin") || return 1
+  n_ext_b=$(count_file_extents "$file_b" "$device" "$ioctl_test_bin") || return 1
+  if [[ "$n_ext_a" -ne "$blocks_per_file" || "$n_ext_b" -ne "$blocks_per_file" ]]; then
+    pr_err "Expected $blocks_per_file extents per file, got A=$n_ext_a B=$n_ext_b"
+    return 1
+  fi
+
+  local -i expect_files=$((base[files] + 2))
+  local -i expect_extents=$((base[total_extents] + total_blocks))
+  local -i clean=0
+  if [[ "${base[files]}" -eq 0 && "${base[total_extents]}" -eq 0 ]]; then
+    clean=1
+  fi
+
+  load_stats s || return 1
+  assert_eq "files before defrag" "${s[files]}" "$expect_files" || return 1
+  assert_eq "total_extents before defrag" "${s[total_extents]}" "$expect_extents" || return 1
+  assert_eq "fragmentation before defrag" "${s[fragmentation]}" "$((expect_extents * 100 / expect_files))" || return 1
+  if [[ "$clean" -eq 1 ]]; then
+    assert_eq "fragmentation of 8 extents over 2 files" "${s[fragmentation]}" 400 || return 1
+    # every extent holds a single block
+    assert_eq "avg_extent_size before defrag" "${s[avg_extent_size]}" "$((total_blocks * 100 / expect_extents))" || return 1
+  fi
+  assert_block_accounting s || return 1
+  local -i frag_before=${s[fragmentation]}
+
+  # Defragmenting A must not touch B.
+  if ! "$ioctl_test_bin" "$file_a" "$device" defrag; then
+    pr_err "defrag ioctl on A failed"
+    return 1
+  fi
+
+  n_ext_a=$(count_file_extents "$file_a" "$device" "$ioctl_test_bin") || return 1
+  n_ext_b=$(count_file_extents "$file_b" "$device" "$ioctl_test_bin") || return 1
+  if [[ "$n_ext_a" -ne 1 || "$n_ext_b" -ne "$blocks_per_file" ]]; then
+    pr_err "After defrag of A expected A=1 B=$blocks_per_file extents, got A=$n_ext_a B=$n_ext_b"
+    return 1
+  fi
+
+  expect_extents=$((base[total_extents] + blocks_per_file + 1))
+  load_stats s || return 1
+  assert_eq "total_extents after defrag of A" "${s[total_extents]}" "$expect_extents" || return 1
+  assert_eq "fragmentation after defrag of A" "${s[fragmentation]}" "$((expect_extents * 100 / expect_files))" || return 1
+  assert_block_accounting s || return 1
+
+  if ! "$ioctl_test_bin" "$file_b" "$device" defrag; then
+    pr_err "defrag ioctl on B failed"
+    return 1
+  fi
+
+  n_ext_a=$(count_file_extents "$file_a" "$device" "$ioctl_test_bin") || return 1
+  n_ext_b=$(count_file_extents "$file_b" "$device" "$ioctl_test_bin") || return 1
+  if [[ "$n_ext_a" -ne 1 || "$n_ext_b" -ne 1 ]]; then
+    pr_err "After defrag of both expected 1 extent each, got A=$n_ext_a B=$n_ext_b"
+    return 1
+  fi
+
+  expect_extents=$((base[total_extents] + 2))
+  load_stats s || return 1
+  assert_eq "files after defrag" "${s[files]}" "$expect_files" || return 1
+  assert_eq "total_extents after defrag" "${s[total_extents]}" "$expect_extents" || return 1
+  assert_eq "fragmentation after defrag" "${s[fragmentation]}" "$((expect_extents * 100 / expect_files))" || return 1
+  if [[ "$clean" -eq 1 ]]; then
+    assert_eq "fragmentation of 2 extents over 2 files" "${s[fragmentation]}" 100 || return 1
+    # defrag moves blocks around but must not change the accumulated count
+    assert_eq "avg_extent_size after defrag" "${s[avg_extent_size]}" "$((total_blocks * 100 / expect_extents))" || return 1
+  fi
+  assert_block_accounting s || return 1
+
+  # Content must have survived the block copying; cmp also catches a size change.
+  if ! dd if="$file_a" of="$got" bs="$BLOCK_SIZE" 2>/dev/null || ! cmp -s "$ref_a" "$got"; then
+    pr_err "content of A changed during defrag"
+    return 1
+  fi
+  if ! dd if="$file_b" of="$got" bs="$BLOCK_SIZE" 2>/dev/null || ! cmp -s "$ref_b" "$got"; then
+    pr_err "content of B changed during defrag"
+    return 1
+  fi
+
+  echo "Confirmed: fragmentation $frag_before -> ${s[fragmentation]} after defragmenting both files"
 }
 
 # Validates the reservation window: small sequential writes stay in one extent
@@ -1295,6 +1649,24 @@ assert_eq() {
     pr_err "$label: expected $expected but got $actual"
     return 1
   fi
+}
+
+# Print how many extents a file currently has, via GET_EXTENTS + dmesg.
+# Usage: count_file_extents <file> <ctl device> <ioctl helper>
+count_file_extents() {
+  local file=$1
+  local device=$2
+  local bin=$3
+
+  dmesg -C 2>/dev/null || true
+  if ! "$bin" "$file" "$device"; then
+    pr_err "ioctl on $file failed"
+    return 1
+  fi
+
+  local -i n_ext
+  n_ext=$(dmesg | grep -c 'start=') || n_ext=0
+  printf '%s\n' "$n_ext"
 }
 
 # Print the larger of two integers.

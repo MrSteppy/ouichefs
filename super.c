@@ -142,10 +142,7 @@ static void ouichefs_evict_inode(struct inode *inode)
 					break;
 
 				if (start) {
-					// Iterate over all blocks in the extent
-					for (int j = 0; j < count; ++j) {
-						put_block(sbi, start + j);
-					}
+					ouichefs_free_contiguous(sb, start, count);
 				}
 
 				sbi->nr_total_extents--;

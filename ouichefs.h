@@ -66,6 +66,7 @@ struct ouichefs_inode {
 };
 
 extern uint32_t reservation_size;
+extern uint32_t fragmentation_threshold;
 
 struct ouichefs_inode_info {
 	uint32_t index_block;
@@ -135,8 +136,13 @@ void ouichefs_collect_garbage(const struct inode *skip);
 extern const struct file_operations ouichefs_file_ops;
 extern const struct file_operations ouichefs_dir_ops;
 extern const struct address_space_operations ouichefs_aops;
+int ouichefs_file_defragment(struct inode *inode);
+void ouichefs_superblock_defragment(struct super_block *sb);
 int ouichefs_truncate(struct inode *inode);
 extern uint32_t ouichefs_calculate_max_file_size(struct super_block *sb);
+
+/* functions for sysfs stats */
+uint32_t calculate_fragmentation(const struct ouichefs_sb_info *sbi);
 
 /* Getters for superblock and inode */
 #define OUICHEFS_SB(sb) ((sb)->s_fs_info)
